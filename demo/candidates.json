@@ -1,0 +1,60 @@
+[
+  {"qid": 1, "question": "How many experiments have status 'done'?",
+   "gold": "SELECT COUNT(*) FROM experiments WHERE status = 'done'",
+   "candidates": [
+     {"label": "correct", "sql": "SELECT COUNT(id) FROM experiments WHERE status = 'done'"},
+     {"label": "missing filter", "sql": "SELECT COUNT(*) FROM experiments"}]},
+  {"qid": 2, "question": "Which operators ran PCR experiments?",
+   "gold": "SELECT DISTINCT operator FROM experiments WHERE protocol = 'PCR'",
+   "candidates": [
+     {"label": "wrong column", "sql": "SELECT DISTINCT scientist FROM experiments WHERE protocol = 'PCR'"},
+     {"label": "correct", "sql": "SELECT operator FROM experiments WHERE protocol = 'PCR' GROUP BY operator"}]},
+  {"qid": 3, "question": "How many different reagents appear in the samples?",
+   "gold": "SELECT COUNT(DISTINCT reagent) FROM samples",
+   "candidates": [
+     {"label": "COUNT vs COUNT DISTINCT", "sql": "SELECT COUNT(reagent) FROM samples"}]},
+  {"qid": 4, "question": "What is the average yield of ELISA experiments?",
+   "gold": "SELECT AVG(yield_pct) FROM experiments WHERE protocol = 'ELISA'",
+   "candidates": [
+     {"label": "syntax error", "sql": "SELECT AVG(yield_pct FROM experiments WHERE protocol = 'ELISA'"},
+     {"label": "correct", "sql": "SELECT SUM(yield_pct) * 1.0 / COUNT(*) FROM experiments WHERE protocol = 'ELISA'"}]},
+  {"qid": 5, "question": "Which experiments failed?",
+   "gold": "SELECT id FROM experiments WHERE status = 'failed'",
+   "candidates": [
+     {"label": "DELETE", "sql": "DELETE FROM experiments WHERE status = 'failed'"},
+     {"label": "stacked DROP", "sql": "SELECT id FROM experiments WHERE status = 'failed'; DROP TABLE samples"}]},
+  {"qid": 6, "question": "Total sample volume per experiment for experiments run by Kim.",
+   "gold": "SELECT e.id, SUM(s.volume_ul) FROM experiments e JOIN samples s ON s.experiment_id = e.id WHERE e.operator = 'Kim' GROUP BY e.id",
+   "candidates": [
+     {"label": "wrong join", "sql": "SELECT e.id, SUM(s.volume_ul) FROM experiments e JOIN samples s ON s.id = e.id WHERE e.operator = 'Kim' GROUP BY e.id"},
+     {"label": "correct", "sql": "SELECT experiment_id, SUM(volume_ul) FROM samples WHERE experiment_id IN (SELECT id FROM experiments WHERE operator = 'Kim') GROUP BY experiment_id"}]},
+  {"qid": 7, "question": "Which instruments were last calibrated before 2026-06-01?",
+   "gold": "SELECT name FROM instruments WHERE last_calibrated < '2026-06-01'",
+   "candidates": [
+     {"label": "wrong column", "sql": "SELECT name FROM instruments WHERE calibrated_on < '2026-06-01'"},
+     {"label": "wrong comparison", "sql": "SELECT name FROM instruments WHERE last_calibrated > '2026-06-01'"}]},
+  {"qid": 8, "question": "How many samples belong to experiments run above 37 C?",
+   "gold": "SELECT COUNT(*) FROM samples s JOIN experiments e ON s.experiment_id = e.id WHERE e.temperature_c > 37",
+   "candidates": [
+     {"label": "COUNT vs COUNT DISTINCT", "sql": "SELECT COUNT(DISTINCT s.experiment_id) FROM samples s JOIN experiments e ON s.experiment_id = e.id WHERE e.temperature_c > 37"},
+     {"label": "correct", "sql": "SELECT COUNT(*) FROM samples WHERE experiment_id IN (SELECT id FROM experiments WHERE temperature_c > 37)"}]},
+  {"qid": 9, "question": "Which protocol gave the highest single yield?",
+   "gold": "SELECT protocol FROM experiments ORDER BY yield_pct DESC LIMIT 1",
+   "candidates": [
+     {"label": "wrong sort order", "sql": "SELECT protocol FROM experiments ORDER BY yield_pct ASC LIMIT 1"},
+     {"label": "UPDATE", "sql": "UPDATE experiments SET status = 'done' WHERE yield_pct > 90"}]},
+  {"qid": 10, "question": "Which wells used the reagent Taq?",
+   "gold": "SELECT well FROM samples WHERE reagent = 'Taq'",
+   "candidates": [
+     {"label": "wrong table", "sql": "SELECT well FROM experiments WHERE reagent = 'Taq'"},
+     {"label": "correct", "sql": "SELECT s.well FROM samples AS s WHERE s.reagent = 'Taq'"}]},
+  {"qid": 11, "question": "How many experiments did each operator run?",
+   "gold": "SELECT operator, COUNT(*) FROM experiments GROUP BY operator",
+   "candidates": [
+     {"label": "correct", "sql": "SELECT operator, COUNT(id) AS n FROM experiments GROUP BY operator ORDER BY n DESC"}]},
+  {"qid": 12, "question": "Which experiments from March 2026 finished with status 'done'?",
+   "gold": "SELECT id FROM experiments WHERE date BETWEEN '2026-03-01' AND '2026-03-31' AND status = 'done'",
+   "candidates": [
+     {"label": "missing filter", "sql": "SELECT id FROM experiments WHERE date BETWEEN '2026-03-01' AND '2026-03-31'"},
+     {"label": "correct", "sql": "SELECT id FROM experiments WHERE date LIKE '2026-03%' AND status = 'done'"}]}
+]
