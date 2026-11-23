@@ -189,9 +189,14 @@ def _read_only_authorizer(
     return sqlite3.SQLITE_DENY
 
 
+def _allow_all_authorizer(*_args: Any) -> int:
+    """Permissive authorizer used during setup/introspection (avoids CPython 3.10 set_authorizer(None) bug)."""
+    return sqlite3.SQLITE_OK
+
+
 def lock_connection_readonly(con: sqlite3.Connection) -> sqlite3.Connection:
     """Apply defense-in-depth engine locks (`query_only`, no extensions, strict authorizer)."""
-    con.set_authorizer(None)
+    con.set_authorizer(_allow_all_authorizer)
     con.execute("PRAGMA query_only = ON")
     if hasattr(con, "enable_load_extension"):
         try:
@@ -204,7 +209,7 @@ def lock_connection_readonly(con: sqlite3.Connection) -> sqlite3.Connection:
 
 def introspect_sqlite_schema(con: sqlite3.Connection) -> dict[str, list[str]]:
     """Dynamically extract `{table_name: [col_names...]}` from any SQLite connection."""
-    con.set_authorizer(None)
+    con.set_authorizer(_allow_all_authorizer)
     try:
         tables_rows = con.execute(
             "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') "
