@@ -2,9 +2,39 @@
 
 Trust nothing a model writes until a *strict checker* says yes: Lean for logic, SQL for data, protocol rules for the bench.
 
+> **Auto-Lab Ecosystem**: Layer `L4 · Digital-Twin Rehearsal & Default-Deny Verification` in [auto-lab](https://github.com/yaniguan/auto-lab) · [Project Studio](https://yaniguan.github.io/auto-lab/)
+
 ## Where it fits
 
-In the lab agent on [yaniguan.github.io](https://yaniguan.github.io/), the body (a bounded harness around every job) puts a default-deny gate on each job. This repo collects checkers and benchmarks for three kinds of model output: Lean proofs, SQL queries over lab data, and machine-readable protocols. A Lean 4 protocol language is being built separately in [YLM](https://github.com/yaniguan/YLM) (`lean/`), so it is linked, not copied, here. The first attempt is a layered SQL gate.
+In the [Auto-Lab](https://github.com/yaniguan/auto-lab) system ([yaniguan.github.io/auto-lab](https://yaniguan.github.io/auto-lab/)), the body (a bounded harness around every job) puts a default-deny gate on each job. This repo collects checkers and benchmarks for three kinds of model output: Lean proofs, SQL queries over lab data, and machine-readable protocols. A Lean 4 protocol language is being built separately in [YLM](https://github.com/yaniguan/YLM) (`lean/`), so it is linked, not copied, here. The first attempt is a layered SQL gate.
+
+## System Profile: Object · Data · Model · Training · History · Unique Properties
+
+Full architectural documentation, verification-layer semantics, commit history, and sibling-repository contracts are maintained in [`docs/ARCHITECTURE_AND_HISTORY.md`](docs/ARCHITECTURE_AND_HISTORY.md):
+
+- **Object**: Default-deny mechanical verification gate (`L4`) auditing LLM-generated SQL queries, formal Lean 4 proofs (`YLM/lean`), and laboratory protocol outputs before database execution or benchtop dispatch.
+- **Data**: Deterministic 30-row **synthetic** in-memory SQLite lab database (`12` experiments, `14` samples, `4` instruments), `12` analytics questions with gold SQL and `22` labeled candidate queries (`8` correct, `14` error cases in `demo/candidates.json`), plus curated links to 5 text-to-SQL/Lean benchmarks and 11 open-source verification repos.
+- **Model**: Four-layer sequential fail-fast SQL gate (`demo/sql_gate.py`): Layer 1 syntax parse (`sqlglot`), Layer 2 AST + SQLite `PRAGMA query_only` read-only enforcement, Layer 3 static table/column schema resolution, and Layer 4 execution multiset equivalence (`22/22` label agreement; catches `7/14` semantic errors missed by static layers 1–3). No neural model is trained here.
+- **Training**: Zero parametric training; deterministic symbolic/execution checker designed to gate runtime inference and supply verifiable pass/fail feedback to `L3` post-training (`labbench-posttrain`, `twinstep`).
+- **History**: Initialized in `3255ec7` (`2026-11-18`) with the 4-layer SQLite gate, 22-candidate benchmark suite, reference output, CI workflow, and formal/SQL literature map.
+- **Unique Properties**: Dual AST + engine-level read-only isolation, explicit quantification of static vs. semantic error catch rates (`50%` static-pass error rate among wrong SQL queries), and non-duplicated linkage to the sound-and-complete Lean 4 `LabLean` checker in `YLM`.
+
+## Repository Layout
+
+```text
+lab-verify/
+├── .github/workflows/
+│   └── demo.yml                          # CI workflow running demo/sql_gate.py on Python 3.12
+├── demo/
+│   ├── candidates.json                   # 12 lab SQL questions, gold queries, and 22 candidates
+│   ├── output.txt                        # Reference 4-layer gate evaluation table and summary
+│   └── sql_gate.py                       # Synthetic SQLite builder + 4-layer default-deny SQL gate
+├── docs/
+│   └── ARCHITECTURE_AND_HISTORY.md       # Deep technical profile (Object, Data, Model, History)
+├── LICENSE                               # MIT License
+├── README.md                             # Overview, SQL gate results, and verification catalog
+└── requirements.txt                      # Runtime dependency (sqlglot)
+```
 
 ## First attempt
 
