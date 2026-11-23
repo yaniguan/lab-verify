@@ -24,28 +24,46 @@ Full architectural documentation, verification-layer semantics, commit history, 
 ```text
 lab-verify/
 ├── .github/workflows/
-│   └── demo.yml                          # CI workflow running demo/sql_gate.py on Python 3.12
+│   └── demo.yml                          # CI matrix (Python 3.10-3.12): pytest, 22/22 parity, catalog check
+├── catalog/
+│   └── sources.json                      # SPDX, ShareAlike, and commercial-use manifest for benchmarks/repos
 ├── demo/
-│   ├── candidates.json                   # 12 lab SQL questions, gold queries, and 22 candidates
+│   ├── candidates.json                   # Core 12 lab SQL questions, gold queries, and 22 candidates (22/22)
+│   ├── candidates_extended.json          # Extended CTE, multi-row ORDER BY, and NULL-aware benchmark suite
 │   ├── output.txt                        # Reference 4-layer gate evaluation table and summary
-│   └── sql_gate.py                       # Synthetic SQLite builder + 4-layer default-deny SQL gate
+│   └── sql_gate.py                       # CLI / benchmark wrapper around lab_verify
 ├── docs/
 │   └── ARCHITECTURE_AND_HISTORY.md       # Deep technical profile (Object, Data, Model, History)
+├── schema/
+│   └── candidates.schema.json            # Strict JSON Schema for SQL candidate benchmarks
+├── scripts/
+│   └── check_catalog.py                  # Automated SPDX license & markdown URL validator
+├── src/lab_verify/
+│   ├── __init__.py                       # Unified verify() entry point and public API
+│   ├── cli.py                            # CLI (--db, --sql, --gold, --candidates, --lean, --protocol, --json)
+│   ├── lean_gate.py                      # Lean 4 vacuity/sorry/axiom detector and lake toolchain runner
+│   ├── properties.py                     # Runtime semantic property checks (fanout, ranges, uniqueness)
+│   ├── protocol_gate.py                  # Benchtop protocol verifier compatible with lab-rehearsal/twinstep
+│   ├── sql_gate.py                       # Hardened 4-layer SQL gate + SQLite authorizer & progress timeout
+│   └── verdict.py                        # Common VerifyVerdict dataclass
+├── tests/
+│   └── test_sql_gate.py                  # 54-case unit & adversarial SQL/Lean/protocol red-team test suite
 ├── LICENSE                               # MIT License
+├── pyproject.toml                        # Package metadata and lab-verify console script
 ├── README.md                             # Overview, SQL gate results, and verification catalog
-└── requirements.txt                      # Runtime dependency (sqlglot)
+└── requirements.txt                      # Pinned runtime dependency (sqlglot>=25.0,<31.0)
 ```
 
 ## First attempt
 
-An in-memory SQLite database with **synthetic** experiments, samples and instruments. 12 questions with gold SQL and 22 hand-written candidates (8 correct, 14 with typical model errors: wrong column, missing filter, COUNT vs COUNT DISTINCT, wrong join, syntax error, DELETE/UPDATE/DROP). The gate has four layers and stops at the first failure: 1 parse (sqlglot), 2 read-only, 3 schema, 4 execution match against gold.
+An in-memory SQLite database with **synthetic** experiments, samples and instruments (typed with `PRIMARY KEY` / `FOREIGN KEY` constraints, `PRAGMA query_only = ON`, strict `sqlite3.set_authorizer`, VM instruction step budget, and multi-seed counterexample perturbations). 12 questions with gold SQL and 22 hand-written candidates (8 correct, 14 with typical model errors: wrong column, missing filter, COUNT vs COUNT DISTINCT, wrong join, syntax error, DELETE/UPDATE/DROP). The gate has four layers and stops at the first failure: 1 parse (sqlglot), 2 read-only, 3 lexical schema, 4 execution match against gold (or runtime property checks when no gold query exists).
 
 ```bash
-pip install sqlglot
+pip install -e .
 python demo/sql_gate.py
 ```
 
-Output (Linux, CPU only, 2026-11-18):
+Output:
 
 ```
 Toy lab database with SYNTHETIC data: 12 experiments, 14 samples, 4 instruments.
@@ -65,7 +83,7 @@ Toy lab database with SYNTHETIC data: 12 experiments, 14 samples, 4 instruments.
  6  wrong join               4 execution          0 rows vs 4 gold rows
  6  correct                  PASS                 match
  7  wrong column             3 schema             unknown column calibrated_on in instruments
- 7  wrong comparison         4 execution          2 rows vs 2 gold rows
+ 7  wrong comparison         4 execution          row content mismatch (2 rows): e.g. ('Pipette ro
  8  COUNT vs COUNT DISTINCT  4 execution          value (3,) vs gold (7,)
  8  correct                  PASS                 match
  9  wrong sort order         4 execution          value ('Western',) vs gold ('PCR',)

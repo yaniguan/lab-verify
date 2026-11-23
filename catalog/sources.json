@@ -1,0 +1,168 @@
+{
+  "schema_version": "1.0.0",
+  "updated_at": "2026-11-23",
+  "datasets": [
+    {
+      "id": "spider",
+      "name": "Spider",
+      "url": "https://yale-lily.github.io/spider",
+      "spdx_license": "CC-BY-SA-4.0",
+      "license_status": "verified_share_alike",
+      "commercial_use_ok": true,
+      "redistribution_ok": true,
+      "share_alike": true
+    },
+    {
+      "id": "bird",
+      "name": "BIRD",
+      "url": "https://bird-bench.github.io/",
+      "spdx_license": "CC-BY-SA-4.0",
+      "license_status": "verified_share_alike",
+      "commercial_use_ok": true,
+      "redistribution_ok": true,
+      "share_alike": true
+    },
+    {
+      "id": "spider2",
+      "name": "Spider 2.0",
+      "url": "https://spider2-sql.github.io/",
+      "spdx_license": "MIT",
+      "license_status": "verified_open",
+      "commercial_use_ok": true,
+      "redistribution_ok": true,
+      "share_alike": false
+    },
+    {
+      "id": "minif2f",
+      "name": "miniF2F",
+      "url": "https://github.com/facebookresearch/miniF2F",
+      "spdx_license": "MIT",
+      "license_status": "verified_open",
+      "commercial_use_ok": true,
+      "redistribution_ok": true,
+      "share_alike": false
+    },
+    {
+      "id": "leandojo-benchmark",
+      "name": "LeanDojo Benchmark",
+      "url": "https://leandojo.org/",
+      "spdx_license": "NOASSERTION",
+      "license_status": "check_project_site",
+      "commercial_use_ok": false,
+      "redistribution_ok": false,
+      "share_alike": false
+    }
+  ],
+  "repositories": [
+    {
+      "id": "lean4",
+      "name": "leanprover/lean4",
+      "url": "https://github.com/leanprover/lean4",
+      "spdx_license": "Apache-2.0",
+      "license_status": "verified_open",
+      "commercial_use_ok": true,
+      "redistribution_ok": true,
+      "share_alike": false
+    },
+    {
+      "id": "sqlglot",
+      "name": "tobymao/sqlglot",
+      "url": "https://github.com/tobymao/sqlglot",
+      "spdx_license": "MIT",
+      "license_status": "verified_open",
+      "commercial_use_ok": true,
+      "redistribution_ok": true,
+      "share_alike": false
+    },
+    {
+      "id": "mathlib4",
+      "name": "leanprover-community/mathlib4",
+      "url": "https://github.com/leanprover-community/mathlib4",
+      "spdx_license": "Apache-2.0",
+      "license_status": "verified_open",
+      "commercial_use_ok": true,
+      "redistribution_ok": true,
+      "share_alike": false
+    },
+    {
+      "id": "deepseek-prover-v2",
+      "name": "deepseek-ai/DeepSeek-Prover-V2",
+      "url": "https://github.com/deepseek-ai/DeepSeek-Prover-V2",
+      "spdx_license": "LicenseRef-DeepSeek-Model",
+      "license_status": "custom_license",
+      "commercial_use_ok": false,
+      "redistribution_ok": false,
+      "share_alike": false
+    },
+    {
+      "id": "spider2-repo",
+      "name": "xlang-ai/Spider2",
+      "url": "https://github.com/xlang-ai/Spider2",
+      "spdx_license": "MIT",
+      "license_status": "verified_open",
+      "commercial_use_ok": true,
+      "redistribution_ok": true,
+      "share_alike": false
+    },
+    {
+      "id": "leandojo-repo",
+      "name": "lean-dojo/LeanDojo",
+      "url": "https://github.com/lean-dojo/LeanDojo",
+      "spdx_license": "MIT",
+      "license_status": "verified_open",
+      "commercial_use_ok": true,
+      "redistribution_ok": true,
+      "share_alike": false
+    },
+    {
+      "id": "physlib",
+      "name": "leanprover-community/physlib",
+      "url": "https://github.com/leanprover-community/physlib",
+      "spdx_license": "Apache-2.0",
+      "license_status": "verified_open",
+      "commercial_use_ok": true,
+      "redistribution_ok": true,
+      "share_alike": false
+    },
+    {
+      "id": "bird-mini-dev",
+      "name": "bird-bench/mini_dev",
+      "url": "https://github.com/bird-bench/mini_dev",
+      "spdx_license": "NOASSERTION",
+      "license_status": "no_license_file",
+      "commercial_use_ok": false,
+      "redistribution_ok": false,
+      "share_alike": false
+    },
+    {
+      "id": "autoprotocol-python",
+      "name": "autoprotocol/autoprotocol-python",
+      "url": "https://github.com/autoprotocol/autoprotocol-python",
+      "spdx_license": "LicenseRef-Autoprotocol-Custom",
+      "license_status": "custom_license",
+      "commercial_use_ok": false,
+      "redistribution_ok": false,
+      "share_alike": false
+    },
+    {
+      "id": "minif2f-repo",
+      "name": "facebookresearch/miniF2F",
+      "url": "https://github.com/facebookresearch/miniF2F",
+      "spdx_license": "MIT",
+      "license_status": "verified_open",
+      "commercial_use_ok": true,
+      "redistribution_ok": true,
+      "share_alike": false
+    },
+    {
+      "id": "labop",
+      "name": "Bioprotocols/labop",
+      "url": "https://github.com/Bioprotocols/labop",
+      "spdx_license": "MIT",
+      "license_status": "verified_open",
+      "commercial_use_ok": true,
+      "redistribution_ok": true,
+      "share_alike": false
+    }
+  ]
+}

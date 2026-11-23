@@ -6,10 +6,23 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - run: pip install -r requirements.txt
-      - run: python demo/sql_gate.py
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -r requirements.txt -e ".[dev]"
+      - run: pytest -v
+      - name: Verify 22/22 SQL gate benchmark and output parity
+        run: |
+          python demo/sql_gate.py > /tmp/sql_out.txt
+          diff -u demo/output.txt /tmp/sql_out.txt
+      - name: Verify extended benchmark suite (CTEs, ORDER BY, NULLs)
+        run: python demo/sql_gate.py --candidates demo/candidates_extended.json
+      - name: Validate benchmark license catalog and markdown links
+        run: python scripts/check_catalog.py
+      - name: Ensure repository working tree remains clean
+        run: test -z "$(git status --porcelain)"

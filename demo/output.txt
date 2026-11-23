@@ -15,7 +15,7 @@ Toy lab database with SYNTHETIC data: 12 experiments, 14 samples, 4 instruments.
  6  wrong join               4 execution          0 rows vs 4 gold rows
  6  correct                  PASS                 match
  7  wrong column             3 schema             unknown column calibrated_on in instruments
- 7  wrong comparison         4 execution          2 rows vs 2 gold rows
+ 7  wrong comparison         4 execution          row content mismatch (2 rows): e.g. ('Pipette ro
  8  COUNT vs COUNT DISTINCT  4 execution          value (3,) vs gold (7,)
  8  correct                  PASS                 match
  9  wrong sort order         4 execution          value ('Western',) vs gold ('PCR',)
