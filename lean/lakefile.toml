@@ -1,0 +1,6 @@
+name = "lab-verify-lean"
+version = "0.1.0"
+defaultTargets = ["LabVerifyLean"]
+
+[[lean_lib]]
+name = "LabVerifyLean"
