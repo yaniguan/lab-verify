@@ -40,13 +40,15 @@ lab-verify/
 │   └── check_catalog.py                  # Automated SPDX license & markdown URL validator
 ├── src/lab_verify/
 │   ├── __init__.py                       # Unified verify() entry point and public API
-│   ├── cli.py                            # CLI (--db, --sql, --gold, --candidates, --lean, --protocol, --json)
+│   ├── cli.py                            # CLI (--sql, --lean, --protocol, mcp-mint, mcp-verify)
 │   ├── lean_gate.py                      # Lean 4 vacuity/sorry/axiom detector and lake toolchain runner
+│   ├── mcp_gate.py                       # Wire-compatible lean-mcp/v1 capability minting & stateful gate
 │   ├── properties.py                     # Runtime semantic property checks (fanout, ranges, uniqueness)
 │   ├── protocol_gate.py                  # Benchtop protocol verifier compatible with lab-rehearsal/twinstep
 │   ├── sql_gate.py                       # Hardened 4-layer SQL gate + SQLite authorizer & progress timeout
-│   └── verdict.py                        # Common VerifyVerdict dataclass
+│   └── verdict.py                        # Common VerifyVerdict / Verdict dataclass
 ├── tests/
+│   ├── test_mcp_runtime_gate.py          # Zero-trust lean-mcp/v1 envelope, deferral & CLI test suite
 │   └── test_sql_gate.py                  # 54-case unit & adversarial SQL/Lean/protocol red-team test suite
 ├── LICENSE                               # MIT License
 ├── pyproject.toml                        # Package metadata and lab-verify console script
@@ -107,6 +109,20 @@ Wrong candidates that would pass with layers 1-3 only: 7/14
 ```
 
 Parse, read-only and schema checks catch the loud errors, but half of the wrong queries (7 of 14) look fine to them and only the execution match catches them. A real gate needs a reference answer or a property test, not just a parser.
+
+## Lean-MCP Runtime Gate (`lean-mcp/v1`)
+
+`lab_verify.mcp_gate` implements wire-compatible `lean-mcp/v1` zero-trust capability envelopes shared directly with [`stepbot`](https://github.com/yaniguan/stepbot). Every hardware capability token binds:
+1. Canonical HMAC-SHA256 (`mcp_hmac_authentic`) over sorted JSON metadata and deck/volume bounds;
+2. Deterministic `protocol_sha256` payload binding (`mcp_payload_binding`);
+3. Monotonic physical `token_epoch == current_deck_epoch` freshness (`mcp_epoch_freshness`);
+4. Single-use `nonce` tracking (`mcp_nonce_single_use`);
+5. Zero-click autonomous execution inside the Lean-certified regime (`lean_proof_valid and not is_frontier_exception`), while parking unsigned `is_frontier_exception` calls in `LeanMcpGate.deferred_daytime_queue` for daytime human co-signature (`mcp_proof_or_cosigned_exception`).
+
+```bash
+lab-verify mcp-mint --protocol run_script.py --epoch 1 --secret-key "$LEAN_MCP_SECRET_KEY" -o envelope.json
+lab-verify mcp-verify envelope.json --protocol run_script.py --epoch 1 --secret-key "$LEAN_MCP_SECRET_KEY" --json
+```
 
 ## Datasets
 

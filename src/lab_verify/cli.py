@@ -5,10 +5,18 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import json
+import os
 from pathlib import Path
+import sys
 from typing import Any, Sequence
 
 from .lean_gate import verify_lean
+from .mcp_gate import (
+    DEFAULT_MCP_SECRET_KEY,
+    DEFAULT_MCP_TOOL_NAME,
+    mint_mcp_envelope,
+    verify_mcp_envelope,
+)
 from .protocol_gate import verify_protocol
 from .sql_gate import (
     EXPERIMENTS,
@@ -140,7 +148,10 @@ def evaluate_benchmark_file(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lab-verify",
-        description="Default-deny verification gate for SQL queries, Lean 4 proofs, and lab protocols.",
+        description=(
+            "Default-deny verification gate for SQL queries, Lean 4 proofs, lab protocols, "
+            "and Lean-MCP capability envelopes (subcommands: mcp-mint, mcp-verify)."
+        ),
     )
     parser.add_argument("--db", type=Path, default=None, help="Path to read-only SQLite database file.")
     parser.add_argument("--sql", type=str, default=None, help="Candidate SQL query to verify.")
@@ -154,6 +165,42 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lean", type=Path, default=None, help="Lean 4 source file to audit.")
     parser.add_argument("--protocol", type=Path, default=None, help="Benchtop protocol JSON file to verify.")
     parser.add_argument(
+        "--mcp-mint",
+        type=str,
+        default=None,
+        help="Protocol file or 64-hex SHA-256 to mint into a lean-mcp/v1 envelope.",
+    )
+    parser.add_argument(
+        "--mcp-verify",
+        type=Path,
+        default=None,
+        help="Path to a lean-mcp/v1 envelope JSON file to verify.",
+    )
+    parser.add_argument(
+        "--mcp-epoch",
+        type=int,
+        default=1,
+        help="Deck epoch for Lean-MCP envelope minting or verification (default: 1).",
+    )
+    parser.add_argument(
+        "--mcp-secret-key",
+        type=str,
+        default=None,
+        help="Shared HMAC secret key for Lean-MCP envelopes (or set LEAN_MCP_SECRET_KEY).",
+    )
+    parser.add_argument(
+        "--mcp-protocol",
+        type=Path,
+        default=None,
+        help="Actual protocol script/IR file to bind against during --mcp-verify.",
+    )
+    parser.add_argument(
+        "--mcp-output",
+        type=Path,
+        default=None,
+        help="Optional output JSON path for --mcp-mint.",
+    )
+    parser.add_argument(
         "--allow-cross-join",
         action="store_true",
         help="Allow explicit SQL CROSS JOIN in Layer 3.",
@@ -166,9 +213,212 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_mcp_mint_subcommand(sub_argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="lab-verify mcp-mint",
+        description="Mint a wire-compatible lean-mcp/v1 capability envelope.",
+    )
+    parser.add_argument(
+        "target",
+        nargs="?",
+        default=None,
+        help="Optional protocol file path or 64-hex protocol SHA-256.",
+    )
+    parser.add_argument(
+        "--protocol",
+        type=Path,
+        default=None,
+        help="Protocol file (compiled .py or protocol .json) to hash and statically check.",
+    )
+    parser.add_argument(
+        "--protocol-sha256",
+        type=str,
+        default=None,
+        help="Explicit 64-hex SHA-256 of canonical protocol IR or compiled script.",
+    )
+    parser.add_argument("--epoch", type=int, default=1, help="Deck epoch token_epoch (default: 1).")
+    parser.add_argument(
+        "--secret-key",
+        type=str,
+        default=None,
+        help="Shared HMAC secret key (defaults to LEAN_MCP_SECRET_KEY or dev key).",
+    )
+    parser.add_argument(
+        "--tool-name",
+        type=str,
+        default=DEFAULT_MCP_TOOL_NAME,
+        help="Target MCP hardware tool identifier.",
+    )
+    parser.add_argument("--nonce", type=str, default=None, help="Explicit single-use nonce.")
+    parser.add_argument(
+        "--lean-proof-valid",
+        choices=("true", "false"),
+        default=None,
+        help="Explicitly override lean_proof_valid boolean.",
+    )
+    parser.add_argument(
+        "--frontier-exception",
+        action="store_true",
+        help="Mark call as an out-of-regime frontier exception.",
+    )
+    parser.add_argument(
+        "--supervisor-signed",
+        action="store_true",
+        help="Include human supervisor co-signature flag.",
+    )
+    parser.add_argument(
+        "--supervisor-id",
+        type=str,
+        default="",
+        help="Human supervisor identifier when co-signed.",
+    )
+    parser.add_argument("-o", "--output", type=Path, default=None, help="Output JSON file path.")
+    ns = parser.parse_args(sub_argv)
+
+    secret = ns.secret_key or os.environ.get("LEAN_MCP_SECRET_KEY", DEFAULT_MCP_SECRET_KEY)
+    proto_arg: Path | str | None = ns.protocol if ns.protocol is not None else ns.target
+    proof_override = None if ns.lean_proof_valid is None else (ns.lean_proof_valid == "true")
+
+    try:
+        env = mint_mcp_envelope(
+            proto_arg,
+            protocol_sha256=ns.protocol_sha256,
+            secret_key=secret,
+            token_epoch=ns.epoch,
+            tool_name=ns.tool_name,
+            nonce=ns.nonce,
+            lean_proof_valid=proof_override,
+            is_frontier_exception=ns.frontier_exception,
+            human_supervisor_signed=ns.supervisor_signed,
+            human_supervisor_id=ns.supervisor_id,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    rendered = env.to_json(indent=2)
+    if ns.output is not None:
+        ns.output.parent.mkdir(parents=True, exist_ok=True)
+        ns.output.write_text(rendered + "\n", encoding="utf-8", newline="\n")
+    else:
+        print(rendered)
+    return 0
+
+
+def _run_mcp_verify_subcommand(sub_argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="lab-verify mcp-verify",
+        description="Verify a lean-mcp/v1 hardware capability envelope.",
+    )
+    parser.add_argument(
+        "envelope_pos",
+        nargs="?",
+        type=Path,
+        default=None,
+        help="Path to lean-mcp/v1 envelope JSON file.",
+    )
+    parser.add_argument(
+        "--envelope",
+        type=Path,
+        default=None,
+        help="Path to lean-mcp/v1 envelope JSON file.",
+    )
+    parser.add_argument(
+        "--protocol",
+        type=Path,
+        default=None,
+        help="Actual protocol script/JSON file to verify against protocol_sha256.",
+    )
+    parser.add_argument(
+        "--protocol-sha256",
+        type=str,
+        default=None,
+        help="Actual 64-hex protocol SHA-256 to verify against protocol_sha256.",
+    )
+    parser.add_argument(
+        "--epoch",
+        type=int,
+        default=1,
+        help="Current physical deck epoch (default: 1).",
+    )
+    parser.add_argument(
+        "--secret-key",
+        type=str,
+        default=None,
+        help="Shared HMAC secret key (defaults to LEAN_MCP_SECRET_KEY or dev key).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON VerifyVerdict.",
+    )
+    ns = parser.parse_args(sub_argv)
+
+    env_path = ns.envelope if ns.envelope is not None else ns.envelope_pos
+    if env_path is None:
+        print("ERROR: mcp-verify requires an envelope JSON file path", file=sys.stderr)
+        return 1
+
+    secret = ns.secret_key or os.environ.get("LEAN_MCP_SECRET_KEY", DEFAULT_MCP_SECRET_KEY)
+    verdict = verify_mcp_envelope(
+        env_path,
+        secret_key=secret,
+        current_deck_epoch=ns.epoch,
+        actual_protocol=ns.protocol,
+        actual_protocol_sha256=ns.protocol_sha256,
+    )
+    if ns.json:
+        print(json.dumps(verdict.to_dict(), indent=2))
+    else:
+        status = "PASS" if verdict.passed else f"FAIL ({verdict.layer})"
+        print(f"{status}: {verdict.reason}")
+    return 0 if verdict.passed else 1
+
+
 def main(argv: Sequence[str] | None = None, *, default_candidates: Path | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    if effective_argv:
+        if effective_argv[0] == "mcp-mint":
+            return _run_mcp_mint_subcommand(effective_argv[1:])
+        if effective_argv[0] == "mcp-verify":
+            return _run_mcp_verify_subcommand(effective_argv[1:])
+
+    args = build_parser().parse_args(effective_argv)
     repo_root = Path(__file__).resolve().parents[2]
+
+    if args.mcp_mint is not None:
+        secret = args.mcp_secret_key or os.environ.get("LEAN_MCP_SECRET_KEY", DEFAULT_MCP_SECRET_KEY)
+        try:
+            env = mint_mcp_envelope(
+                args.mcp_mint,
+                secret_key=secret,
+                token_epoch=args.mcp_epoch,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        rendered = env.to_json(indent=2)
+        if args.mcp_output is not None:
+            args.mcp_output.parent.mkdir(parents=True, exist_ok=True)
+            args.mcp_output.write_text(rendered + "\n", encoding="utf-8", newline="\n")
+        else:
+            print(rendered)
+        return 0
+
+    if args.mcp_verify is not None:
+        secret = args.mcp_secret_key or os.environ.get("LEAN_MCP_SECRET_KEY", DEFAULT_MCP_SECRET_KEY)
+        verdict = verify_mcp_envelope(
+            args.mcp_verify,
+            secret_key=secret,
+            current_deck_epoch=args.mcp_epoch,
+            actual_protocol=args.mcp_protocol,
+        )
+        if args.json:
+            print(json.dumps(verdict.to_dict(), indent=2))
+        else:
+            status = "PASS" if verdict.passed else f"FAIL ({verdict.layer})"
+            print(f"{status}: {verdict.reason}")
+        return 0 if verdict.passed else 1
 
     if args.lean is not None:
         verdict = verify_lean(args.lean, run_toolchain=True)

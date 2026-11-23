@@ -22,3 +22,6 @@ class VerifyVerdict:
             "reason": self.reason,
             "diagnostics": list(self.diagnostics),
         }
+
+
+Verdict = VerifyVerdict
