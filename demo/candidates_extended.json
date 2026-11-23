@@ -1,0 +1,62 @@
+[
+  {
+    "qid": 1,
+    "question": "Rank all completed experiments by yield descending.",
+    "gold": "SELECT id, yield_pct FROM experiments WHERE status = 'done' ORDER BY yield_pct DESC, id ASC",
+    "candidates": [
+      {
+        "label": "correct",
+        "sql": "WITH done_runs AS (SELECT id, yield_pct FROM experiments WHERE status = 'done') SELECT id, yield_pct FROM done_runs ORDER BY yield_pct DESC, id ASC"
+      },
+      {
+        "label": "inverted multi-row order",
+        "sql": "SELECT id, yield_pct FROM experiments WHERE status = 'done' ORDER BY yield_pct ASC, id ASC"
+      }
+    ]
+  },
+  {
+    "qid": 2,
+    "question": "Total sample volume per experiment for experiments run by Kim (CTE formulation).",
+    "gold": "SELECT e.id, SUM(s.volume_ul) FROM experiments e JOIN samples s ON s.experiment_id = e.id WHERE e.operator = 'Kim' GROUP BY e.id",
+    "candidates": [
+      {
+        "label": "correct",
+        "sql": "WITH kim_exps AS (SELECT id FROM experiments WHERE operator = 'Kim') SELECT k.id, SUM(s.volume_ul) FROM kim_exps k JOIN samples s ON s.experiment_id = k.id GROUP BY k.id"
+      },
+      {
+        "label": "missing ON clause",
+        "sql": "SELECT e.id, SUM(s.volume_ul) FROM experiments e JOIN samples s WHERE e.operator = 'Kim' GROUP BY e.id"
+      }
+    ]
+  },
+  {
+    "qid": 3,
+    "question": "How many experiments have a recorded (non-NULL) yield?",
+    "gold": "SELECT COUNT(yield_pct) FROM experiments",
+    "candidates": [
+      {
+        "label": "correct",
+        "sql": "SELECT COUNT(*) FROM experiments WHERE yield_pct IS NOT NULL"
+      },
+      {
+        "label": "NULL-blind COUNT(*)",
+        "sql": "SELECT COUNT(*) FROM experiments"
+      }
+    ]
+  },
+  {
+    "qid": 4,
+    "question": "Which experiments were executed manually without an assigned instrument?",
+    "gold": "SELECT id FROM experiments WHERE instrument_id IS NULL",
+    "candidates": [
+      {
+        "label": "correct",
+        "sql": "SELECT e.id FROM experiments e LEFT JOIN instruments i ON e.instrument_id = i.id WHERE i.id IS NULL"
+      },
+      {
+        "label": "wrong = NULL comparison",
+        "sql": "SELECT id FROM experiments WHERE instrument_id = NULL"
+      }
+    ]
+  }
+]
