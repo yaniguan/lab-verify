@@ -189,6 +189,42 @@ def test_idea_13_benchmark_24_sql_candidates() -> None:
     assert all(count >= 2 for count in mut_m["catches_by_mutant"].values())
 
 
+def test_issue_29_inner_cte_order_by_and_int_float_sum_total_parity() -> None:
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE samples (id INT, grp TEXT, v REAL, cnt INT)")
+    con.executemany(
+        "INSERT INTO samples VALUES (?, ?, ?, ?)",
+        [(1, "G1", 0.2, 3), (2, "G2", 0.5, 7), (3, "G3", 0.9, 11)],
+    )
+    try:
+        # 1. Outer GROUP BY is unordered even though inner CTE contains ORDER BY ... LIMIT 2
+        verdict = evaluate_sql_against_mutants(
+            candidate_sql=(
+                "SELECT grp, SUM(v) FROM samples WHERE grp = 'G2' "
+                "UNION ALL SELECT grp, SUM(v) FROM samples WHERE grp = 'G1'"
+            ),
+            gold_sql=(
+                "WITH top2 AS (SELECT * FROM samples ORDER BY v ASC LIMIT 2) "
+                "SELECT grp, SUM(v) FROM top2 GROUP BY grp"
+            ),
+            seed_conn=con,
+            mutants={},
+        )
+        assert verdict.passed_seed_db is True
+        assert verdict.passed_all_mutants is True
+
+        # 2. SQLite SUM(int_col) (int) vs TOTAL(int_col) (float) and midpoint float tolerance
+        v_parity = evaluate_sql_against_mutants(
+            candidate_sql="SELECT grp, TOTAL(cnt), SUM(v) * 1.0 / COUNT(v) FROM samples GROUP BY grp",
+            gold_sql="SELECT grp, SUM(cnt), AVG(v) FROM samples GROUP BY grp",
+            seed_conn=con,
+            mutants={},
+        )
+        assert v_parity.passed_seed_db is True
+    finally:
+        con.close()
+
+
 def _strip_lean_comments_and_strings(src: str) -> str:
     no_block = re.sub(r"/-.*?-/", " ", src, flags=re.DOTALL)
     no_line = re.sub(r"--[^\n]*", " ", no_block)

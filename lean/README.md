@@ -10,9 +10,11 @@
    - `counterexample_mutant_mismatch_denied`: formalizes Idea #13 (`mutant_sql_synthesizer.py`), denying candidates that pass the seed DB but fail synthesized counterexample mutants.
 2. **Formal Lean 4 Proof Gate**
    - `LeanProofCheck`, `checkLeanProofGate`, `sorry_proof_always_denied`, and `unsafe_or_vacuous_proof_denied`.
-3. **Zero-Trust `Lean-MCP` Capability Firewall (Idea #12)**
-   - `McpHardwareEnvelope`, `checkMcpHardwareCall`.
+3. **Zero-Trust `Lean-MCP` Capability Firewall & Key/TTL Boundaries (Idea #12)**
+   - `McpHardwareEnvelope`, `checkMcpHardwareCall`, `McpWireEnvelope`, `checkMcpWireEnvelope`.
    - `autonomous_mcp_requires_fresh_lean_proof`, `stale_epoch_mcp_always_denied`, and `unsigned_frontier_mcp_always_denied`.
+   - `revoked_key_epoch_always_denied`, `expired_ttl_mcp_always_denied`, and `expired_cosign_mcp_always_denied`.
+   - `autonomous_wire_envelope_soundness` and `cosigned_frontier_wire_envelope_soundness`.
 
 ## Build and Verify
 

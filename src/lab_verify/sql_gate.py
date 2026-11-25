@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections import Counter
+from bisect import bisect_left, bisect_right
+from collections import Counter, deque
 from dataclasses import dataclass
 import json
 import logging
@@ -126,6 +127,8 @@ FORBIDDEN_SQLITE_FUNCTIONS: frozenset[str] = frozenset(
         "load_extension",
         "randomblob",
         "zeroblob",
+        "printf",
+        "format",
         "fts3_tokenizer",
         "writefile",
         "readfile",
@@ -339,12 +342,91 @@ def check_read_only(stmts: Sequence[exp.Expression]) -> str | None:
 
 
 # ---- Layer 3: Lexical Schema, CTE, Alias, Join, & SetOperation Validator ----
+def _ast_references_table(expr: exp.Expression, table_lc: str) -> bool:
+    for tbl in expr.find_all(exp.Table):
+        if not tbl.db and (tbl.name or "").lower() == table_lc:
+            return True
+    return False
+
+
+def _flatten_union_branches(
+    expr: exp.Expression,
+) -> tuple[list[exp.Expression], list[exp.Expression]]:
+    branches: list[exp.Expression] = []
+    orders: list[exp.Expression] = []
+
+    def _collect(cur: exp.Expression) -> bool:
+        if isinstance(cur, exp.Subquery):
+            return _collect(cur.this)
+        if isinstance(cur, exp.Union):
+            order_node = cur.args.get("order")
+            if order_node is not None:
+                orders.append(order_node)
+            return _collect(cur.this) and _collect(cur.expression)
+        branches.append(cur)
+        return True
+
+    _collect(expr)
+    return branches, orders
+
+
+def _check_recursive_string_expansion(
+    branch: exp.Expression,
+    cte_alias: str,
+    cte_lc: str,
+    rec_cols: Sequence[str],
+) -> str | None:
+    target = branch.this if isinstance(branch, exp.Subquery) else branch
+    rec_aliases: set[str] = set()
+    other_tables = 0
+    for tbl in target.find_all(exp.Table):
+        if not tbl.db and (tbl.name or "").lower() == cte_lc:
+            rec_aliases.add((tbl.alias or tbl.name).lower())
+        else:
+            other_tables += 1
+    if not rec_aliases:
+        return None
+    rec_col_set = {c.lower() for c in rec_cols}
+
+    def _is_rec_col(col: exp.Column) -> bool:
+        if col.table:
+            return col.table.lower() in rec_aliases
+        return other_tables == 0 or (col.name or "").lower() in rec_col_set
+
+    def _count_rec_refs(sub: exp.Expression) -> int:
+        return sum(1 for c in sub.find_all(exp.Column) if _is_rec_col(c))
+
+    for node in target.walk():
+        if isinstance(node, exp.DPipe) and _count_rec_refs(node) >= 2:
+            return (
+                f"recursive CTE {cte_alias} contains exponential string self-concatenation"
+            )
+        if isinstance(node, (exp.Anonymous, exp.Func)):
+            cand_names = (
+                [node.name]
+                if isinstance(node, exp.Anonymous)
+                else [node.sql_name(), getattr(node, "name", "")]
+            )
+            for raw_fn in cand_names:
+                fn = str(raw_fn or "").lower()
+                if fn in ("concat", "concat_ws") and _count_rec_refs(node) >= 2:
+                    return (
+                        f"recursive CTE {cte_alias} contains exponential string self-concatenation"
+                    )
+                if fn in ("replace", "hex", "quote") and _count_rec_refs(node) >= 1:
+                    return (
+                        f"recursive CTE {cte_alias} contains unbounded string expansion ({fn})"
+                    )
+    return None
+
+
 def check_schema(
     stmt: exp.Expression,
     schema: Mapping[str, Sequence[str]] | None = None,
     *,
     strict_joins: bool = True,
     allow_cross_join: bool = False,
+    allow_recursive_cte: bool = True,
     raw_sql: str = "",
 ) -> str | None:
     """Validate table/column visibility per lexical scope, CTEs, star expansions, joins, and unions."""
@@ -374,27 +456,74 @@ def check_schema(
                 explicit_cols = [
                     c.name.lower() for c in (alias_obj.columns if alias_obj and alias_obj.columns else [])
                 ]
-                if is_recursive:
-                    if explicit_cols:
-                        local_cte_env[cte_lc] = explicit_cols
-                    elif isinstance(cte.this, exp.SetOperation):
-                        base_cols, base_err = _validate_query(cte.this.this, local_cte_env, outer_sources)
-                        if base_err:
-                            return None, base_err
-                        local_cte_env[cte_lc] = list(base_cols or [])
-                cte_cols, cte_err = _validate_query(cte.this, local_cte_env, outer_sources)
-                if cte_err:
-                    return None, cte_err
-                assert cte_cols is not None
-                if explicit_cols:
-                    if len(explicit_cols) != len(cte_cols):
+                self_refs = is_recursive and _ast_references_table(cte.this, cte_lc)
+                if self_refs:
+                    if not allow_recursive_cte:
+                        return None, f"recursive CTE {cte_alias} is forbidden by policy"
+                    cte_body = cte.this.this if isinstance(cte.this, exp.Subquery) else cte.this
+                    if not isinstance(cte_body, exp.Union):
                         return (
                             None,
-                            f"CTE {cte_alias} column count mismatch ({len(explicit_cols)} vs {len(cte_cols)})",
+                            f"recursive CTE {cte_alias} requires UNION or UNION ALL with a non-recursive anchor branch",
                         )
-                    local_cte_env[cte_lc] = explicit_cols
+                    branches, union_orders = _flatten_union_branches(cte_body)
+                    if len(branches) < 2 or _ast_references_table(branches[0], cte_lc):
+                        return (
+                            None,
+                            f"recursive CTE {cte_alias} requires a non-recursive anchor branch",
+                        )
+                    anchor_env = {k: v for k, v in local_cte_env.items() if k != cte_lc}
+                    anchor_cols, anchor_err = _validate_query(branches[0], anchor_env, outer_sources)
+                    if anchor_err:
+                        return None, anchor_err
+                    assert anchor_cols is not None
+                    if explicit_cols:
+                        if len(explicit_cols) != len(anchor_cols):
+                            return (
+                                None,
+                                f"CTE {cte_alias} column count mismatch ({len(explicit_cols)} vs {len(anchor_cols)})",
+                            )
+                        rec_cols = explicit_cols
+                    else:
+                        rec_cols = list(anchor_cols)
+                    rec_env = {**local_cte_env, cte_lc: rec_cols}
+                    for rec_branch in branches[1:]:
+                        rb_cols, rb_err = _validate_query(rec_branch, rec_env, outer_sources)
+                        if rb_err:
+                            return None, rb_err
+                        assert rb_cols is not None
+                        if len(rb_cols) != len(rec_cols):
+                            return (
+                                None,
+                                f"compound query column count mismatch ({len(rec_cols)} vs {len(rb_cols)})",
+                            )
+                        exp_err = _check_recursive_string_expansion(
+                            rec_branch, cte_alias, cte_lc, rec_cols
+                        )
+                        if exp_err:
+                            return None, exp_err
+                    for order_clause in union_orders:
+                        for o_col in order_clause.find_all(exp.Column):
+                            if o_col.table:
+                                return None, f"unknown table alias {o_col.table}"
+                            if o_col.name.lower() not in rec_cols:
+                                return None, f"unknown column {o_col.name} in compound query"
+                    local_cte_env[cte_lc] = rec_cols
                 else:
-                    local_cte_env[cte_lc] = cte_cols
+                    non_rec_env = {k: v for k, v in local_cte_env.items() if k != cte_lc} if not is_recursive else local_cte_env
+                    cte_cols, cte_err = _validate_query(cte.this, non_rec_env, outer_sources)
+                    if cte_err:
+                        return None, cte_err
+                    assert cte_cols is not None
+                    if explicit_cols:
+                        if len(explicit_cols) != len(cte_cols):
+                            return (
+                                None,
+                                f"CTE {cte_alias} column count mismatch ({len(explicit_cols)} vs {len(cte_cols)})",
+                            )
+                        local_cte_env[cte_lc] = explicit_cols
+                    else:
+                        local_cte_env[cte_lc] = cte_cols
 
         if isinstance(node, exp.SetOperation):
             left_cols, left_err = _validate_query(node.this, local_cte_env, outer_sources)
@@ -670,7 +799,7 @@ def _cell_sort_key(val: Any) -> tuple[int, Any]:
         fval = float(val)
         if math.isnan(fval):
             return (2, float("inf"))
-        return (2, round(fval, 5))
+        return (2, 0.0 if fval == 0.0 else fval)
     if isinstance(val, str):
         return (3, val)
     if isinstance(val, (bytes, bytearray)):
@@ -726,26 +855,152 @@ def _coerce_gold(gold_result: QueryResult | Counter[tuple[Any, ...]] | Sequence[
     return QueryResult(rows=rows_t, columns=cols, ordered=False)
 
 
+def _hopcroft_karp(
+    n_left: int,
+    n_right: int,
+    adj: Sequence[Sequence[int]],
+) -> tuple[int, list[int], list[int]]:
+    """Iterative Hopcroft-Karp maximum bipartite matching in O(E * sqrt(V)) time."""
+    pair_u = [-1] * n_left
+    pair_v = [-1] * n_right
+    dist = [0] * n_left
+    matched = 0
+
+    while True:
+        queue: deque[int] = deque()
+        found_aug = False
+        for u in range(n_left):
+            if pair_u[u] == -1:
+                dist[u] = 0
+                queue.append(u)
+            else:
+                dist[u] = -1
+
+        while queue:
+            u = queue.popleft()
+            for v in adj[u]:
+                pu = pair_v[v]
+                if pu == -1:
+                    found_aug = True
+                elif dist[pu] == -1:
+                    dist[pu] = dist[u] + 1
+                    queue.append(pu)
+
+        if not found_aug:
+            break
+
+        next_edge = [0] * n_left
+        for start_u in range(n_left):
+            if pair_u[start_u] != -1:
+                continue
+            stack: list[tuple[int, int]] = [(start_u, -1)]
+            while stack:
+                u, _ = stack[-1]
+                idx = next_edge[u]
+                neighbors = adj[u]
+                if idx >= len(neighbors):
+                    dist[u] = -1
+                    stack.pop()
+                    continue
+                v = neighbors[idx]
+                next_edge[u] = idx + 1
+                pu = pair_v[v]
+                if pu == -1:
+                    stack[-1] = (u, v)
+                    for su, sv in stack:
+                        pair_u[su] = sv
+                        pair_v[sv] = su
+                    matched += 1
+                    stack.clear()
+                elif dist[pu] == dist[u] + 1 and next_edge[pu] < len(adj[pu]):
+                    stack[-1] = (u, v)
+                    stack.append((pu, -1))
+
+    return matched, pair_u, pair_v
+
+
+def _non_numeric_row_signature(row: tuple[Any, ...]) -> tuple[int, tuple[tuple[int, type, Any], ...]]:
+    return (
+        len(row),
+        tuple((idx, type(val), val) for idx, val in enumerate(row) if not _is_sql_number(val)),
+    )
+
+
 def _multiset_match(
     got_rows: Sequence[tuple[Any, ...]],
     gold_rows: Sequence[tuple[Any, ...]],
+    *,
+    rel_tol: float = 1e-6,
+    abs_tol: float = 1e-6,
 ) -> tuple[bool, tuple[Any, ...] | None, tuple[Any, ...] | None]:
     if len(got_rows) != len(gold_rows):
         return False, None, None
+    n = len(got_rows)
+    if n == 0:
+        return True, None, None
+
     s_got = sorted(got_rows, key=_row_sort_key)
-    s_gold = list(sorted(gold_rows, key=_row_sort_key))
-    used = [False] * len(s_gold)
-    for gr in s_got:
-        matched_idx = -1
-        for idx, gold_r in enumerate(s_gold):
-            if not used[idx] and rows_equal(gr, gold_r):
-                matched_idx = idx
-                break
-        if matched_idx == -1:
-            first_unmatched_gold = next((s_gold[j] for j in range(len(s_gold)) if not used[j]), None)
-            return False, gr, first_unmatched_gold
-        used[matched_idx] = True
-    return True, None, None
+    s_gold = sorted(gold_rows, key=_row_sort_key)
+
+    # O(N) fast-path: if canonical unrounded sort aligns every row 1-to-1, bijection holds immediately.
+    if all(rows_equal(r1, r2, rel_tol=rel_tol, abs_tol=abs_tol) for r1, r2 in zip(s_got, s_gold)):
+        return True, None, None
+
+    got_groups: dict[Any, list[int]] = {}
+    gold_groups: dict[Any, list[int]] = {}
+    for idx, r in enumerate(s_got):
+        got_groups.setdefault(_non_numeric_row_signature(r), []).append(idx)
+    for idx, r in enumerate(s_gold):
+        gold_groups.setdefault(_non_numeric_row_signature(r), []).append(idx)
+
+    matched_got = [False] * n
+    matched_gold = [False] * n
+    denom = max(0.5, 1.0 - rel_tol)
+
+    for key, g_idxs in got_groups.items():
+        h_idxs = gold_groups.get(key)
+        if not h_idxs:
+            continue
+        sample_row = s_got[g_idxs[0]]
+        num_cols = [c for c, val in enumerate(sample_row) if _is_sql_number(val)]
+        if not num_cols:
+            k = min(len(g_idxs), len(h_idxs))
+            for i in range(k):
+                matched_got[g_idxs[i]] = True
+                matched_gold[h_idxs[i]] = True
+            continue
+
+        c0 = num_cols[0]
+        g_sorted = sorted(g_idxs, key=lambda idx: float(s_got[idx][c0]))
+        h_sorted = sorted(h_idxs, key=lambda idx: float(s_gold[idx][c0]))
+        h_x = [float(s_gold[idx][c0]) for idx in h_sorted]
+
+        adj: list[list[int]] = []
+        for g_global in g_sorted:
+            gr = s_got[g_global]
+            gx = float(gr[c0])
+            radius = max(abs_tol, (rel_tol / denom) * abs(gx)) * 1.05 + 1e-15
+            lo = bisect_left(h_x, gx - radius)
+            hi = bisect_right(h_x, gx + radius)
+            edges = [
+                v_local
+                for v_local in range(lo, hi)
+                if rows_equal(gr, s_gold[h_sorted[v_local]], rel_tol=rel_tol, abs_tol=abs_tol)
+            ]
+            adj.append(edges)
+
+        _, pair_u, _ = _hopcroft_karp(len(g_sorted), len(h_sorted), adj)
+        for u_local, v_local in enumerate(pair_u):
+            if v_local != -1:
+                matched_got[g_sorted[u_local]] = True
+                matched_gold[h_sorted[v_local]] = True
+
+    if all(matched_got):
+        return True, None, None
+
+    first_unmatched_got = next((s_got[i] for i in range(n) if not matched_got[i]), None)
+    first_unmatched_gold = next((s_gold[j] for j in range(n) if not matched_gold[j]), None)
+    return False, first_unmatched_got, first_unmatched_gold
 
 
 def compare_results(got: QueryResult, gold: QueryResult) -> str | None:
@@ -795,9 +1050,11 @@ def run_query(
     max_vm_steps: int = 100_000,
     timeout_s: float = 1.0,
     max_rows: int = 10_000,
+    max_value_bytes: int = 1_048_576,
+    max_expr_depth: int = 100,
 ) -> QueryResult:
-    """Execute read-only SQL under SQLite VM step budget, wall-clock timeout, and row cap."""
-    tick_interval = 1_000
+    """Execute read-only SQL under SQLite VM step budget, byte/depth limits, wall-clock timeout, and row cap."""
+    tick_interval = min(100, max(1, max_vm_steps))
     max_callbacks = max(1, math.ceil(max_vm_steps / tick_interval))
     callbacks = 0
     t0 = time.monotonic()
@@ -814,6 +1071,45 @@ def run_query(
             return 1
         return 0
 
+    saved_limits: list[tuple[int, int]] = []
+    if hasattr(con, "setlimit"):
+        limit_len_cat = getattr(sqlite3, "SQLITE_LIMIT_LENGTH", None)
+        if limit_len_cat is not None and max_value_bytes > 0:
+            try:
+                prev_len = con.setlimit(limit_len_cat, max_value_bytes)
+                saved_limits.append((limit_len_cat, prev_len))
+            except sqlite3.Error:
+                pass
+        limit_expr_cat = getattr(sqlite3, "SQLITE_LIMIT_EXPR_DEPTH", None)
+        if limit_expr_cat is not None and max_expr_depth > 0:
+            try:
+                prev_depth = con.setlimit(limit_expr_cat, max_expr_depth)
+                saved_limits.append((limit_expr_cat, prev_depth))
+            except sqlite3.Error:
+                pass
+    elif max_value_bytes > 0 and "recursive" in sql.lower():
+        # Python 3.10 lacks sqlite3.Connection.setlimit; guard direct run_query() against recursive bombs
+        stmts_fb, err_fb = check_parse(sql)
+        if not err_fb and stmts_fb:
+            for wc in stmts_fb[0].find_all(exp.With):
+                if wc.args.get("recursive"):
+                    for cte in wc.expressions:
+                        cte_lc = (cte.alias or "").lower()
+                        cte_body = cte.this.this if isinstance(cte.this, exp.Subquery) else cte.this
+                        if isinstance(cte_body, exp.Union) and _ast_references_table(cte_body, cte_lc):
+                            branches, _ = _flatten_union_branches(cte_body)
+                            alias_obj = cte.args.get("alias")
+                            explicit_cols = [
+                                c.name.lower()
+                                for c in (alias_obj.columns if alias_obj and alias_obj.columns else [])
+                            ]
+                            for rb in branches[1:]:
+                                exp_err = _check_recursive_string_expansion(
+                                    rb, cte.alias, cte_lc, explicit_cols
+                                )
+                                if exp_err:
+                                    raise ExecutionLimitError(exp_err)
+
     con.set_progress_handler(_progress_cb, tick_interval)
     try:
         cur = con.execute(sql)
@@ -821,14 +1117,34 @@ def run_query(
         fetched = cur.fetchmany(max_rows + 1)
         if len(fetched) > max_rows:
             raise ExecutionLimitError(f"query exceeded max_rows cap ({max_rows})")
+        for r_idx, row in enumerate(fetched, 1):
+            for c_idx, val in enumerate(row, 1):
+                if isinstance(val, str) and len(val.encode("utf-8")) > max_value_bytes:
+                    raise ExecutionLimitError(
+                        f"cell at row {r_idx}, col {c_idx} exceeded max_value_bytes ({max_value_bytes})"
+                    )
+                if isinstance(val, (bytes, bytearray)) and len(val) > max_value_bytes:
+                    raise ExecutionLimitError(
+                        f"blob at row {r_idx}, col {c_idx} exceeded max_value_bytes ({max_value_bytes})"
+                    )
         rows = tuple(tuple(r) for r in fetched)
         return QueryResult(rows=rows, columns=cols, ordered=ordered)
+    except sqlite3.DataError as exc:
+        raise ExecutionLimitError(f"exceeded SQLite value size limit ({max_value_bytes} bytes): {exc}") from exc
     except sqlite3.OperationalError as exc:
         if abort_reason:
             raise ExecutionLimitError(abort_reason[0]) from exc
+        err_lc = str(exc).lower()
+        if "too big" in err_lc or "expression tree is too large" in err_lc:
+            raise ExecutionLimitError(f"exceeded SQLite limit: {exc}") from exc
         raise
     finally:
         con.set_progress_handler(None, 0)
+        for cat, prev_val in reversed(saved_limits):
+            try:
+                con.setlimit(cat, prev_val)
+            except sqlite3.Error:
+                pass
 
 
 def run(
@@ -838,6 +1154,7 @@ def run(
     max_vm_steps: int = 100_000,
     timeout_s: float = 1.0,
     max_rows: int = 10_000,
+    max_value_bytes: int = 1_048_576,
 ) -> QueryResult:
     """Execute `sql` and detect whether `ORDER BY` is present on the outer query."""
     stmts, err = check_parse(sql)
@@ -851,6 +1168,7 @@ def run(
         max_vm_steps=max_vm_steps,
         timeout_s=timeout_s,
         max_rows=max_rows,
+        max_value_bytes=max_value_bytes,
     )
 
 
@@ -865,9 +1183,11 @@ def gate(
     schema: Mapping[str, Sequence[str]] | None = None,
     strict_joins: bool = True,
     allow_cross_join: bool = False,
+    allow_recursive_cte: bool = True,
     max_vm_steps: int = 100_000,
     timeout_s: float = 1.0,
     max_rows: int = 10_000,
+    max_value_bytes: int = 1_048_576,
 ) -> tuple[int | None, str]:
     """4-layer fail-fast default-deny SQL gate returning `(failed_layer_index | None, reason)`."""
     stmts, err = check_parse(sql)
@@ -883,6 +1203,7 @@ def gate(
         schema=schema,
         strict_joins=strict_joins,
         allow_cross_join=allow_cross_join,
+        allow_recursive_cte=allow_recursive_cte,
         raw_sql=str(sql),
     )
     if err:
@@ -897,6 +1218,7 @@ def gate(
             max_vm_steps=max_vm_steps,
             timeout_s=timeout_s,
             max_rows=max_rows,
+            max_value_bytes=max_value_bytes,
         )
     except ExecutionLimitError as exc:
         return 3, f"execution limit: {exc}"
@@ -922,6 +1244,7 @@ def gate(
                         max_vm_steps=max_vm_steps,
                         timeout_s=timeout_s,
                         max_rows=max_rows,
+                        max_value_bytes=max_value_bytes,
                     )
                     ce_got = run_query(
                         ce_con,
@@ -930,6 +1253,7 @@ def gate(
                         max_vm_steps=max_vm_steps,
                         timeout_s=timeout_s,
                         max_rows=max_rows,
+                        max_value_bytes=max_value_bytes,
                     )
                 except (ExecutionLimitError, sqlite3.Error) as exc:
                     return 3, f"counterexample db #{idx} error: {exc}"
@@ -957,6 +1281,7 @@ def verify_sql(
     schema: Mapping[str, Sequence[str]] | None = None,
     strict_joins: bool = True,
     allow_cross_join: bool = False,
+    allow_recursive_cte: bool = True,
 ) -> VerifyVerdict:
     """Evaluate SQL through the 4-layer gate and return a unified `VerifyVerdict`."""
     resolved_gold = gold_result
@@ -968,6 +1293,7 @@ def verify_sql(
             schema=schema,
             strict_joins=strict_joins,
             allow_cross_join=allow_cross_join,
+            allow_recursive_cte=allow_recursive_cte,
         )
         if g_layer is not None:
             return VerifyVerdict(
@@ -988,6 +1314,7 @@ def verify_sql(
         schema=schema,
         strict_joins=strict_joins,
         allow_cross_join=allow_cross_join,
+        allow_recursive_cte=allow_recursive_cte,
     )
     if layer_idx is None:
         return VerifyVerdict(passed=True, layer=None, reason="match", diagnostics=[])

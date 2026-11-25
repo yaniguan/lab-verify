@@ -15,9 +15,22 @@ with a strict read-only SQLite authorizer before executing candidate SQL.
 
 from __future__ import annotations
 
+from pathlib import Path
 import sqlite3
+import sys
 from dataclasses import dataclass
 from typing import Any
+
+_SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
+from lab_verify.sql_gate import (  # noqa: E402
+    FORBIDDEN_SQLITE_FUNCTIONS,
+    ExecutionLimitError,
+    compare_results,
+    run,
+)
 
 ALLOWED_READONLY_ACTIONS: frozenset[int] = frozenset(
     {
@@ -36,11 +49,15 @@ def _readonly_authorizer(
     dbname: str | None,
     source: str | None,
 ) -> int:
-    _ = (arg2, dbname, source)
+    _ = (dbname, source)
     if action not in ALLOWED_READONLY_ACTIONS:
         return sqlite3.SQLITE_DENY
     if arg1 and arg1.lower().startswith("sqlite_"):
         return sqlite3.SQLITE_DENY
+    if action == sqlite3.SQLITE_FUNCTION and arg2:
+        fn = arg2.lower()
+        if fn in FORBIDDEN_SQLITE_FUNCTIONS or fn.startswith("pragma_"):
+            return sqlite3.SQLITE_DENY
     return sqlite3.SQLITE_OK
 
 
@@ -323,49 +340,31 @@ def synthesize_five_sqlite_mutants(
     return mutants
 
 
-def _normalize_cell(val: Any) -> Any:
-    if isinstance(val, float):
-        return round(val, 6)
-    return val
-
-
-def _execute_normalized(
-    conn: sqlite3.Connection,
-    sql: str,
-    *,
-    ordered: bool,
-) -> list[tuple[Any, ...]]:
-    rows = [tuple(_normalize_cell(v) for v in row) for row in conn.execute(sql).fetchall()]
-    if ordered:
-        return rows
-    return sorted(rows, key=lambda r: tuple((v is None, str(type(v)), v) for v in r))
-
-
 def evaluate_sql_against_mutants(
     candidate_sql: str,
     gold_sql: str,
     seed_conn: sqlite3.Connection,
     mutants: dict[str, sqlite3.Connection],
 ) -> MutantGateVerdict:
-    """Compare candidate_sql against gold_sql on the clean seed DB and all 5 mutants."""
-    has_order_by = "ORDER BY" in gold_sql.upper()
+    """Compare candidate_sql against gold_sql on the clean seed DB and all 5 mutants via Layer-4 AST/bipartite gate."""
     try:
-        gold_seed = _execute_normalized(seed_conn, gold_sql, ordered=has_order_by)
-        cand_seed = _execute_normalized(seed_conn, candidate_sql, ordered=has_order_by)
-    except sqlite3.Error as exc:
+        gold_seed = run(seed_conn, gold_sql)
+        cand_seed = run(seed_conn, candidate_sql)
+    except (ExecutionLimitError, sqlite3.Error) as exc:
         return MutantGateVerdict(False, False, ("seed_execution_error",), str(exc))
 
-    if cand_seed != gold_seed:
-        return MutantGateVerdict(False, False, ("seed_db_mismatch",), None)
+    seed_err = compare_results(cand_seed, gold_seed)
+    if seed_err is not None:
+        return MutantGateVerdict(False, False, ("seed_db_mismatch",), seed_err)
 
     failing: list[str] = []
     for m_name, m_conn in mutants.items():
         try:
-            gold_res = _execute_normalized(m_conn, gold_sql, ordered=has_order_by)
-            cand_res = _execute_normalized(m_conn, candidate_sql, ordered=has_order_by)
-        except sqlite3.Error as exc:
+            gold_res = run(m_conn, gold_sql)
+            cand_res = run(m_conn, candidate_sql)
+        except (ExecutionLimitError, sqlite3.Error) as exc:
             return MutantGateVerdict(True, False, (m_name,), str(exc))
-        if cand_res != gold_res:
+        if compare_results(cand_res, gold_res) is not None:
             failing.append(m_name)
 
     return MutantGateVerdict(

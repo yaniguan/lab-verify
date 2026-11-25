@@ -7,8 +7,10 @@ Formalizes:
    `mutating_or_stacked_sql_denied`, and `counterexample_mutant_mismatch_denied`).
 2. Formal Lean proof gate (`LeanProofCheck`, `checkLeanProofGate`, `sorry_proof_always_denied`).
 3. Stateful zero-trust `Lean-MCP` capability firewall (`McpHardwareEnvelope`,
-   `checkMcpHardwareCall`, `autonomous_mcp_requires_fresh_lean_proof`, and
-   `stale_epoch_mcp_always_denied`).
+   `checkMcpHardwareCall`, `McpWireEnvelope`, `checkMcpWireEnvelope`,
+   `revoked_key_epoch_always_denied`, `expired_ttl_mcp_always_denied`,
+   `expired_cosign_mcp_always_denied`, `autonomous_wire_envelope_soundness`, and
+   `cosigned_frontier_wire_envelope_soundness`).
 -/
 namespace LabVerifyLean
 
@@ -34,7 +36,7 @@ theorem firstViolation_none_iff (checks : List (Bool × RegimeViolation)) :
   induction checks with
   | nil => simp [firstViolation]
   | cons hd tl ih =>
-    rcases hd with ⟨b, v⟩
+    rcases hd with ⟨b, _⟩
     cases b with
     | false => simp [firstViolation]
     | true  => simp [firstViolation, ih]
@@ -198,34 +200,50 @@ theorem unsigned_frontier_mcp_always_denied (e : McpHardwareEnvelope)
   rw [hf] at hiff
   simp at hiff
 
-/-- Full wire-compatible `lean-mcp/v1` zero-trust capability envelope binding HMAC authenticity,
-    SHA-256 protocol payload hash, deck epoch freshness, single-use nonce, and proof/co-signature. -/
+/-- Full wire-compatible `lean-mcp/v1` zero-trust capability envelope binding cryptographic
+    authenticity, SHA-256 protocol payload hash, signing key-rotation epoch bounds, physical
+    deck epoch freshness, single-use nonce, TTL/co-signature expiration window, and
+    Lean proof certificate or role-separated human supervisor co-signature. -/
 structure McpWireEnvelope where
-  hmacAuthentic       : Bool
-  tokenPayloadHash    : String
-  actualPayloadHash   : String
-  tokenEpoch          : Nat
-  currentDeckEpoch    : Nat
-  nonceFresh          : Bool
-  leanProofValid      : Bool
-  isFrontierException : Bool
-  humanSupervisorSign : Bool
+  hmacAuthentic        : Bool
+  tokenPayloadHash     : String
+  actualPayloadHash    : String
+  keyEpoch             : Nat := 1
+  minActiveKeyEpoch    : Nat := 1
+  tokenEpoch           : Nat
+  currentDeckEpoch     : Nat
+  nonceFresh           : Bool
+  issuedAtUnix         : Nat := 0
+  nowSec               : Nat := 0
+  ttlSeconds           : Nat := 3600
+  cosignedExpiresAtSec : Nat := 3600
+  leanProofValid       : Bool
+  isFrontierException  : Bool
+  humanSupervisorSign  : Bool
   deriving DecidableEq, Repr
 
 def checkMcpWireEnvelope (w : McpWireEnvelope) : Option RegimeViolation :=
   firstViolation
     [ (w.hmacAuthentic,
         { rule := "mcp_hmac_authentic",
-          detail := "envelope HMAC-SHA256 verification failed" }),
+          detail := "envelope signature or HMAC-SHA256 verification failed" }),
       (decide (w.tokenPayloadHash == w.actualPayloadHash),
         { rule := "mcp_payload_binding",
           detail := "compiled protocol SHA-256 does not match envelope protocol_sha256" }),
+      (decide (w.keyEpoch ≥ w.minActiveKeyEpoch),
+        { rule := "mcp_key_epoch_active",
+          detail := "signing key epoch predates minimum active key-rotation epoch" }),
       (decide (w.tokenEpoch == w.currentDeckEpoch),
         { rule := "mcp_epoch_freshness",
           detail := "stale MCP capability token replayed against an updated deck state" }),
       (w.nonceFresh,
         { rule := "mcp_nonce_single_use",
           detail := "replay detected: capability nonce already consumed" }),
+      (decide (w.ttlSeconds > 0 ∧ w.issuedAtUnix ≤ w.nowSec ∧
+               w.nowSec ≤ w.issuedAtUnix + w.ttlSeconds ∧
+               w.nowSec ≤ w.cosignedExpiresAtSec),
+        { rule := "mcp_ttl_unexpired",
+          detail := "capability envelope or supervisor co-signature TTL window expired" }),
       (decide ((w.leanProofValid && !w.isFrontierException) ∨
                (w.isFrontierException && w.humanSupervisorSign)),
         { rule := "mcp_proof_or_cosigned_exception",
@@ -241,12 +259,23 @@ theorem mcp_payload_hash_binding (w : McpWireEnvelope)
   simp only [firstViolation_cons, firstViolation_nil, and_true, decide_eq_true_eq, beq_iff_eq] at hok
   exact hswap hok.2.1
 
-/-- HMAC authenticity theorem: any tampered envelope (`hmacAuthentic = false`) is denied. -/
+/-- Cryptographic authenticity theorem: any tampered envelope (`hmacAuthentic = false`) is denied. -/
 theorem mcp_hmac_tamper_always_denied (w : McpWireEnvelope)
     (htamp : w.hmacAuthentic = false) :
     checkMcpWireEnvelope w ≠ none := by
   unfold checkMcpWireEnvelope
   simp [firstViolation, htamp]
+
+/-- Key-rotation boundary theorem: any envelope signed under a retired/revoked key epoch
+    (`keyEpoch < minActiveKeyEpoch`) is unconditionally denied. -/
+theorem revoked_key_epoch_always_denied (w : McpWireEnvelope)
+    (hrev : w.keyEpoch < w.minActiveKeyEpoch) :
+    checkMcpWireEnvelope w ≠ none := by
+  intro hok
+  unfold checkMcpWireEnvelope at hok
+  simp only [firstViolation_cons, firstViolation_nil, and_true, decide_eq_true_eq] at hok
+  have hke : w.minActiveKeyEpoch ≤ w.keyEpoch := hok.2.2.1
+  omega
 
 /-- Single-use nonce theorem: any replayed nonce (`nonceFresh = false`) is denied. -/
 theorem mcp_nonce_replay_always_denied (w : McpWireEnvelope)
@@ -255,24 +284,67 @@ theorem mcp_nonce_replay_always_denied (w : McpWireEnvelope)
   intro hok
   unfold checkMcpWireEnvelope at hok
   simp only [firstViolation_cons, firstViolation_nil, and_true] at hok
-  have hnf := hok.2.2.2.1
+  have hnf := hok.2.2.2.2.1
   rw [hrep] at hnf
   contradiction
 
+/-- Wall-clock TTL expiration theorem: any capability token whose age exceeds `ttlSeconds`
+    (`nowSec > issuedAtUnix + ttlSeconds`) is unconditionally denied even on an idle deck. -/
+theorem expired_ttl_mcp_always_denied (w : McpWireEnvelope)
+    (hexp : w.nowSec > w.issuedAtUnix + w.ttlSeconds) :
+    checkMcpWireEnvelope w ≠ none := by
+  intro hok
+  unfold checkMcpWireEnvelope at hok
+  simp only [firstViolation_cons, firstViolation_nil, and_true, decide_eq_true_eq] at hok
+  have httl := hok.2.2.2.2.2.1
+  omega
+
+/-- Supervisor co-signature expiration theorem: any envelope evaluated past
+    `cosignedExpiresAtSec` (`nowSec > cosignedExpiresAtSec`) is unconditionally denied. -/
+theorem expired_cosign_mcp_always_denied (w : McpWireEnvelope)
+    (hexp : w.nowSec > w.cosignedExpiresAtSec) :
+    checkMcpWireEnvelope w ≠ none := by
+  intro hok
+  unfold checkMcpWireEnvelope at hok
+  simp only [firstViolation_cons, firstViolation_nil, and_true, decide_eq_true_eq] at hok
+  have httl := hok.2.2.2.2.2.1
+  omega
+
 /-- Complete autonomous wire-envelope soundness theorem: without human intervention
-    (`humanSupervisorSign = false`), hardware dispatch is permitted iff all 5 zero-trust
-    invariants hold simultaneously. -/
+    (`humanSupervisorSign = false`), hardware dispatch is permitted iff all 7 zero-trust
+    cryptographic, key-epoch, deck-epoch, nonce, TTL, and proof invariants hold. -/
 theorem autonomous_wire_envelope_soundness (w : McpWireEnvelope)
     (hnoHuman : w.humanSupervisorSign = false) :
     checkMcpWireEnvelope w = none ↔
       (w.hmacAuthentic = true ∧
        w.tokenPayloadHash = w.actualPayloadHash ∧
+       w.keyEpoch ≥ w.minActiveKeyEpoch ∧
        w.tokenEpoch = w.currentDeckEpoch ∧
        w.nonceFresh = true ∧
+       (w.ttlSeconds > 0 ∧ w.issuedAtUnix ≤ w.nowSec ∧
+        w.nowSec ≤ w.issuedAtUnix + w.ttlSeconds ∧ w.nowSec ≤ w.cosignedExpiresAtSec) ∧
        w.leanProofValid = true ∧
        w.isFrontierException = false) := by
   unfold checkMcpWireEnvelope
   simp [firstViolation_cons, firstViolation_nil, hnoHuman]
+
+/-- Complete frontier co-signature soundness theorem: for an out-of-regime frontier
+    exception (`isFrontierException = true`), hardware dispatch is permitted iff
+    authenticity, payload hash, active key epoch, live deck epoch, single-use nonce,
+    unexpired TTL / `cosignedExpiresAtSec` window, and `humanSupervisorSign = true` all hold. -/
+theorem cosigned_frontier_wire_envelope_soundness (w : McpWireEnvelope)
+    (hfront : w.isFrontierException = true) :
+    checkMcpWireEnvelope w = none ↔
+      (w.hmacAuthentic = true ∧
+       w.tokenPayloadHash = w.actualPayloadHash ∧
+       w.keyEpoch ≥ w.minActiveKeyEpoch ∧
+       w.tokenEpoch = w.currentDeckEpoch ∧
+       w.nonceFresh = true ∧
+       (w.ttlSeconds > 0 ∧ w.issuedAtUnix ≤ w.nowSec ∧
+        w.nowSec ≤ w.issuedAtUnix + w.ttlSeconds ∧ w.nowSec ≤ w.cosignedExpiresAtSec) ∧
+       w.humanSupervisorSign = true) := by
+  unfold checkMcpWireEnvelope
+  simp [firstViolation_cons, firstViolation_nil, hfront]
 
 /-! ## Compile-Time `#guard` Verification Witnesses -/
 
@@ -308,12 +380,25 @@ private def cleanSql : SqlCandidateCheck :=
 
 private def cleanWireEnv : McpWireEnvelope :=
   { hmacAuthentic := true, tokenPayloadHash := "deadbeef", actualPayloadHash := "deadbeef",
-    tokenEpoch := 1, currentDeckEpoch := 1, nonceFresh := true,
-    leanProofValid := true, isFrontierException := false, humanSupervisorSign := false }
+    keyEpoch := 2, minActiveKeyEpoch := 2, tokenEpoch := 1, currentDeckEpoch := 1,
+    nonceFresh := true, issuedAtUnix := 1000, nowSec := 1200, ttlSeconds := 900,
+    cosignedExpiresAtSec := 1900, leanProofValid := true,
+    isFrontierException := false, humanSupervisorSign := false }
 
 #guard (checkMcpWireEnvelope cleanWireEnv).isNone == true
 #guard (checkMcpWireEnvelope { cleanWireEnv with actualPayloadHash := "tampered" }).isSome == true
 #guard (checkMcpWireEnvelope { cleanWireEnv with nonceFresh := false }).isSome == true
 #guard (checkMcpWireEnvelope { cleanWireEnv with hmacAuthentic := false }).isSome == true
+#guard (checkMcpWireEnvelope { cleanWireEnv with keyEpoch := 1, minActiveKeyEpoch := 2 }).isSome == true
+#guard (checkMcpWireEnvelope { cleanWireEnv with nowSec := 2500 }).isSome == true
+#guard (checkMcpWireEnvelope { cleanWireEnv with cosignedExpiresAtSec := 1100 }).isSome == true
+#guard (checkMcpWireEnvelope
+         { cleanWireEnv with
+             leanProofValid := false, isFrontierException := true,
+             humanSupervisorSign := true }).isNone == true
+#guard (checkMcpWireEnvelope
+         { cleanWireEnv with
+             leanProofValid := false, isFrontierException := true,
+             humanSupervisorSign := true, nowSec := 1950 }).isSome == true
 
 end LabVerifyLean
