@@ -1087,6 +1087,28 @@ def run_query(
                 saved_limits.append((limit_expr_cat, prev_depth))
             except sqlite3.Error:
                 pass
+    elif max_value_bytes > 0 and "recursive" in sql.lower():
+        # Python 3.10 lacks sqlite3.Connection.setlimit; guard direct run_query() against recursive bombs
+        stmts_fb, err_fb = check_parse(sql)
+        if not err_fb and stmts_fb:
+            for wc in stmts_fb[0].find_all(exp.With):
+                if wc.args.get("recursive"):
+                    for cte in wc.expressions:
+                        cte_lc = (cte.alias or "").lower()
+                        cte_body = cte.this.this if isinstance(cte.this, exp.Subquery) else cte.this
+                        if isinstance(cte_body, exp.Union) and _ast_references_table(cte_body, cte_lc):
+                            branches, _ = _flatten_union_branches(cte_body)
+                            alias_obj = cte.args.get("alias")
+                            explicit_cols = [
+                                c.name.lower()
+                                for c in (alias_obj.columns if alias_obj and alias_obj.columns else [])
+                            ]
+                            for rb in branches[1:]:
+                                exp_err = _check_recursive_string_expansion(
+                                    rb, cte.alias, cte_lc, explicit_cols
+                                )
+                                if exp_err:
+                                    raise ExecutionLimitError(exp_err)
 
     con.set_progress_handler(_progress_cb, tick_interval)
     try:
