@@ -571,3 +571,158 @@ def test_issue_22_batch_evaluator_canonical_sql_memoization(db, ce_dbs):
     v2 = ev.evaluate_candidate("select COUNT(id) from experiments where status = 'done';", gold)
     assert v1 == (None, "match") and v2 == (None, "match")
     assert ev.cache_hits == 1
+
+
+# ---- Issue #26: Recursive CTE string-expansion bombs, printf/format, & base-less WITH RECURSIVE ----
+def test_issue_26_recursive_string_bomb_printf_and_baseless_cte_blocked(db):
+    from lab_verify.sql_gate import ExecutionLimitError, compare_results, run_query
+
+    # 1. Quadrupling recursive CTE string bomb rejected before memory allocation
+    bomb_sql = (
+        "WITH RECURSIVE bomb(n, s) AS ("
+        "  SELECT 1, '0123456789abcdef' "
+        "  UNION ALL "
+        "  SELECT n + 1, s || s || s || s FROM bomb WHERE n < 12"
+        ") SELECT MAX(length(s)) FROM bomb"
+    )
+    l_bomb, r_bomb = gate(db, bomb_sql, None, max_vm_steps=5_000, timeout_s=1.0)
+    assert l_bomb == 2
+    assert "exponential string self-concatenation" in r_bomb
+
+    # Also verify runtime SQLITE_LIMIT_LENGTH / max_value_bytes blocks direct run_query()
+    raw_con = sqlite3.connect(":memory:")
+    try:
+        with pytest.raises(ExecutionLimitError):
+            run_query(raw_con, bomb_sql, max_value_bytes=65_536)
+        if hasattr(raw_con, "getlimit") and hasattr(sqlite3, "SQLITE_LIMIT_LENGTH"):
+            assert raw_con.getlimit(sqlite3.SQLITE_LIMIT_LENGTH) > 65_536
+    finally:
+        raw_con.close()
+
+    # 2. printf('%.*c', ...) and format('%.*c', ...) blocked at Layer 2 and SQLite authorizer
+    for fn_name in ("printf", "format"):
+        printf_sql = f"SELECT length({fn_name}('%.*c', 50000000, 'A')) FROM experiments LIMIT 1"
+        l_pf, r_pf = gate(db, printf_sql, None, max_vm_steps=5_000, timeout_s=1.0)
+        assert l_pf == 1
+        assert "forbidden function" in r_pf
+        with pytest.raises(sqlite3.DatabaseError):
+            db.execute(printf_sql)
+
+    # 3. Base-less infinite self-referential CTE caught statically at Layer 3 (schema)
+    for bad_rec in (
+        "WITH RECURSIVE loop(x) AS (SELECT x FROM loop) SELECT x FROM loop",
+        "WITH RECURSIVE loop(x) AS (SELECT x FROM loop UNION ALL SELECT 1) SELECT x FROM loop",
+        "WITH RECURSIVE loop(x) AS (SELECT 1 INTERSECT SELECT x FROM loop) SELECT x FROM loop",
+    ):
+        l_rec, r_rec = gate(db, bad_rec, None, max_vm_steps=5_000)
+        assert l_rec == 2, f"{bad_rec!r} -> layer={l_rec}, reason={r_rec}"
+        assert "recursive CTE" in r_rec
+
+    # 4. Policy flag allow_recursive_cte=False rejects recursive CTEs while keeping normal CTEs valid
+    valid_rec = "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 5) SELECT SUM(n) FROM seq"
+    assert gate(db, valid_rec, None, allow_recursive_cte=True) == (None, "match")
+    l_pol, r_pol = gate(db, valid_rec, None, allow_recursive_cte=False)
+    assert l_pol == 2 and "forbidden by policy" in r_pol
+
+    non_rec_in_rec_clause = (
+        "WITH RECURSIVE helper AS (SELECT id FROM experiments WHERE status = 'done') "
+        "SELECT COUNT(*) FROM helper"
+    )
+    assert gate(db, non_rec_in_rec_clause, None, allow_recursive_cte=False) == (None, "match")
+    _ = compare_results
+
+
+# ---- Issue #29: Unordered float sort-key cliff & Hopcroft-Karp bipartite matching ----
+def test_issue_29_unordered_float_sort_cliff_bipartite_matching_and_symmetry():
+    import random
+    import time
+    from lab_verify.sql_gate import compare_results
+
+    # 1. Exact reproducer from Issue #29 (opposite UNION ALL emission orders within 1e-5 bucket)
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE runs (id INTEGER PRIMARY KEY, grp TEXT, x REAL, y REAL)")
+    con.executemany(
+        "INSERT INTO runs VALUES (?, ?, ?, ?)",
+        [
+            (1, "B", 0.1000010, 0.2000024),
+            (2, "A", 0.1000018, 0.2000016),
+        ],
+    )
+    gold = QueryResult(
+        rows=((0.1000010, 0.2000016), (0.1000002, 0.2000024)),
+        columns=("avg_x", "avg_y"),
+        ordered=False,
+    )
+    r1 = tuple(
+        con.execute(
+            "SELECT AVG(x), AVG(y) FROM runs WHERE grp='B' "
+            "UNION ALL SELECT AVG(x), AVG(y) FROM runs WHERE grp='A'"
+        ).fetchall()
+    )
+    r2 = tuple(
+        con.execute(
+            "SELECT AVG(x), AVG(y) FROM runs WHERE grp='A' "
+            "UNION ALL SELECT AVG(x), AVG(y) FROM runs WHERE grp='B'"
+        ).fetchall()
+    )
+    con.close()
+
+    q1 = QueryResult(r1, ("avg_x", "avg_y"), ordered=False)
+    q2 = QueryResult(r2, ("avg_x", "avg_y"), ordered=False)
+    assert compare_results(q1, gold) is None
+    assert compare_results(q2, gold) is None
+    assert compare_results(gold, q1) is None
+    assert compare_results(gold, q2) is None
+
+    # 2. Adversarial 2D greedy-steal case where even exact float sort + greedy first-fit fails
+    got_adv = QueryResult(
+        rows=((0.1000010, 0.2000024), (0.1000018, 0.2000009)),
+        columns=("x", "y"),
+        ordered=False,
+    )
+    gold_adv = QueryResult(
+        rows=((0.1000010, 0.2000016), (0.1000010, 0.2000024)),
+        columns=("x", "y"),
+        ordered=False,
+    )
+    assert compare_results(got_adv, gold_adv) is None
+    assert compare_results(gold_adv, got_adv) is None
+
+    # 3. Permutation invariance and symmetry across 40 randomized permutations
+    rng = random.Random(20261125)
+    base_gold = [
+        ("G1", 0.1000010 + i * 6e-7, 0.5000010 - i * 5e-7) for i in range(12)
+    ]
+    base_got = [
+        ("G1", gx + ((-1) ** i) * 4e-7, gy + ((-1) ** (i + 1)) * 4e-7)
+        for i, (_, gx, gy) in enumerate(base_gold)
+    ]
+    for _ in range(40):
+        perm_got = list(base_got)
+        perm_gold = list(base_gold)
+        rng.shuffle(perm_got)
+        rng.shuffle(perm_gold)
+        res_ab = compare_results(
+            QueryResult(tuple(perm_got), ("g", "x", "y"), ordered=False),
+            QueryResult(tuple(perm_gold), ("g", "x", "y"), ordered=False),
+        )
+        res_ba = compare_results(
+            QueryResult(tuple(perm_gold), ("g", "x", "y"), ordered=False),
+            QueryResult(tuple(perm_got), ("g", "x", "y"), ordered=False),
+        )
+        assert res_ab is None
+        assert res_ba is None
+
+    # 4. Sub-quadratic scaling on 2,500-row unordered aggregate output
+    big_gold = tuple((f"grp_{i % 25}", float(i) * 0.01, float(i) * 0.02) for i in range(2500))
+    big_got_list = [(g, x + 1e-9, y - 1e-9) for (g, x, y) in big_gold]
+    rng.shuffle(big_got_list)
+    t0 = time.perf_counter()
+    assert (
+        compare_results(
+            QueryResult(tuple(big_got_list), ("g", "x", "y"), ordered=False),
+            QueryResult(big_gold, ("g", "x", "y"), ordered=False),
+        )
+        is None
+    )
+    assert (time.perf_counter() - t0) < 1.0

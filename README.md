@@ -48,8 +48,11 @@ lab-verify/
 │   ├── sql_gate.py                       # Hardened 4-layer SQL gate + SQLite authorizer & progress timeout
 │   └── verdict.py                        # Common VerifyVerdict / Verdict dataclass
 ├── tests/
+│   ├── test_autolab_wire.py              # Auto-Lab 15-repo wire node (autolab-wire/v1) test suite
+│   ├── test_community_extensions.py      # Firewall & mutant-SQL counterexample benchmark tests
 │   ├── test_mcp_runtime_gate.py          # Zero-trust lean-mcp/v1 envelope, deferral & CLI test suite
 │   └── test_sql_gate.py                  # 54-case unit & adversarial SQL/Lean/protocol red-team test suite
+├── autolab_wire.py                       # Layer L4 autolab-wire/v1 node & stepbot capability minter
 ├── LICENSE                               # MIT License
 ├── pyproject.toml                        # Package metadata and lab-verify console script
 ├── README.md                             # Overview, SQL gate results, and verification catalog
@@ -113,16 +116,24 @@ Parse, read-only and schema checks catch the loud errors, but half of the wrong 
 ## Lean-MCP Runtime Gate (`lean-mcp/v1`)
 
 `lab_verify.mcp_gate` implements wire-compatible `lean-mcp/v1` zero-trust capability envelopes shared directly with [`stepbot`](https://github.com/yaniguan/stepbot). Every hardware capability token binds:
-1. Canonical HMAC-SHA256 (`mcp_hmac_authentic`) over sorted JSON metadata and deck/volume bounds;
+1. Canonical HMAC-SHA256 (`mcp_hmac_authentic`, default wire-compatible mode) or asymmetric Ed25519 role-separated signatures (`mcp_signature_authentic`, `auth_mode="ed25519"`) over sorted JSON metadata and deck/volume bounds;
 2. Deterministic `protocol_sha256` payload binding (`mcp_payload_binding`);
-3. Monotonic physical `token_epoch == current_deck_epoch` freshness (`mcp_epoch_freshness`);
-4. Single-use `nonce` tracking (`mcp_nonce_single_use`);
-5. Zero-click autonomous execution inside the Lean-certified regime (`lean_proof_valid and not is_frontier_exception`), while parking unsigned `is_frontier_exception` calls in `LeanMcpGate.deferred_daytime_queue` for daytime human co-signature (`mcp_proof_or_cosigned_exception`).
+3. Active cryptographic key-rotation epoch (`mcp_key_epoch_active`), monotonic physical `token_epoch == current_deck_epoch` freshness (`mcp_epoch_freshness`), and bounded wall-clock TTL / co-signature expiration (`mcp_ttl_unexpired`);
+4. Single-use `nonce` tracking (`mcp_nonce_single_use`) persisted atomically across CLI invocations via `--state <path.json>` (`McpStateStore` OS lockfile + `fsync` + `os.replace`);
+5. Zero-click autonomous execution inside the Lean-certified regime (`lean_proof_valid and not is_frontier_exception`), while parking unsigned `is_frontier_exception` calls in `LeanMcpGate.deferred_daytime_queue` (`L4_VERIFY_FRONTIER_DEFERRED`) for daytime human co-signature (`cosign_deferred_packet` / `mcp_proof_or_cosigned_exception`).
 
 ```bash
-lab-verify mcp-mint --protocol run_script.py --epoch 1 --secret-key "$LEAN_MCP_SECRET_KEY" -o envelope.json
-lab-verify mcp-verify envelope.json --protocol run_script.py --epoch 1 --secret-key "$LEAN_MCP_SECRET_KEY" --json
+lab-verify mcp-mint --protocol run_script.py --state mcp_state.json --secret-key "$LEAN_MCP_SECRET_KEY" -o envelope.json
+lab-verify mcp-verify envelope.json --protocol run_script.py --state mcp_state.json --mutates-deck-state --secret-key "$LEAN_MCP_SECRET_KEY" --json
 ```
+
+## 15-Repository Auto-Lab Wire Contract (`autolab-wire/v1`)
+
+`autolab_wire.py` (`REPO_ID = "lab-verify"`, `LAYER = "L4"`) connects `lab-verify` into the closed-loop 15-repository [Auto-Lab](https://github.com/yaniguan/auto-lab) wire pipeline (`autolab-wire/v1`):
+
+- **Upstream Pre-Execution Flow (`L6` / `L5` / `L4`)**: Consumes candidate SQL queries and rehearsed 96-well protocol IR (`rehearsal.protocol_yaml_dict`) from [`lab-rehearsal`](https://github.com/yaniguan/lab-rehearsal) downstream of [`lab-ears`](https://github.com/yaniguan/lab-ears), [`lab-ask-why`](https://github.com/yaniguan/lab-ask-why), [`lab-decide`](https://github.com/yaniguan/lab-decide), [`assayfold`](https://github.com/yaniguan/assayfold), [`lab-automation-atlas`](https://github.com/yaniguan/lab-automation-atlas), [`buy-or-make`](https://github.com/yaniguan/buy-or-make), and [`labshift`](https://github.com/yaniguan/labshift).
+- **Default-Deny SQL & `lean-mcp/v1` Minting (`L4` -> `L1` `stepbot`)**: `process_packet(packet)` runs the 4-layer read-only SQLite gate (`L4_VERIFY_SQL_BLOCK` on mutating or invalid SQL) and mints an HMAC-authenticated `lean-mcp/v1` capability envelope (`invariant="autonomous_wire_envelope_soundness"`). `mint_for_compiled_stepbot(packet)` binds `verification.mcp_envelope` to the exact compiled Opentrons Python SHA-256 and bounds emitted by [`stepbot`](https://github.com/yaniguan/stepbot) (`StepbotMcpExecutor`), gating physical actuation across [`stepbot`](https://github.com/yaniguan/stepbot), [`lab-hands`](https://github.com/yaniguan/lab-hands) (`L1`), and [`lab-feet`](https://github.com/yaniguan/lab-feet) (`L0`).
+- **Sibling `L4` Post-Run Partner ([`lab-attrib`](https://github.com/yaniguan/lab-attrib))**: Pairs pre-execution default-deny gates (`lab-rehearsal` + `lab-verify`) with post-execution causal blame, NNLS XRD precursor deconvolution, and SHA-256 certified ledger quarantine in [`lab-attrib`](https://github.com/yaniguan/lab-attrib) before verified runs reach [`twinstep`](https://github.com/yaniguan/twinstep), [`labfill`](https://github.com/yaniguan/labfill), and [`labbench-posttrain`](https://github.com/yaniguan/labbench-posttrain) (`L3`).
 
 ## Datasets
 
