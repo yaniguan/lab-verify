@@ -47,8 +47,13 @@ Contains `12` laboratory analytics questions (`qid = 1..12`), each with a verifi
 - **Schema hallucinations (`3`)**: nonexistent column `scientist` (`qid 2`), nonexistent column `calibrated_on` (`qid 7`), wrong table `well FROM experiments` (`qid 10`).
 - **Semantic / execution errors (`7`)**: missing `WHERE` filter (`qid 1`, `qid 12`), `COUNT` vs. `COUNT(DISTINCT)` (`qid 3`, `qid 8`), wrong join predicate `s.id = e.id` (`qid 6`), inverted inequality `>` vs. `<` (`qid 7`), inverted `ORDER BY ... ASC LIMIT 1` (`qid 9`).
 
-### Curated External Benchmarks and License Posture
-`README.md` catalogs 5 external text-to-SQL and formal-reasoning benchmarks (`Spider` CC BY-SA 4.0, `BIRD` CC BY-SA 4.0, `Spider 2.0` MIT code, `miniF2F` MIT, `LeanDojo Benchmark`), 11 open-source tools (`lean4`, `sqlglot`, `mathlib4`, `DeepSeek-Prover-V2`, `Spider2`, `LeanDojo`, `physlib`, `bird-bench/mini_dev`, `autoprotocol-python`, `miniF2F`, `labop`), and 11 research papers (`2018`–`2026`). No external benchmark files are redistributed in the repository; custom or missing upstream licenses (`DeepSeek-Prover-V2`, `bird-bench/mini_dev`, `autoprotocol-python`) are explicitly annotated.
+### Curated External Benchmarks, 2024–2026 Adapters, and License Posture
+`catalog/sources.json` (`v1.1.0`) and `README.md` catalog 16 external Text-to-SQL and Lean 4 formal-reasoning benchmarks (`Spider` CC-BY-SA-4.0, `BIRD` CC-BY-SA-4.0, `Spider 2.0` & `Spider 2.0-Lite` MIT, `BIRD Mini-Dev` CC-BY-SA-4.0, `EHRSQL-2024` CC-BY-4.0, `BIRD-CRITIC 1.0 SQLite` CC-BY-SA-4.0, `LiveSQLBench Base-Lite SQLite` CC-BY-SA-4.0, `miniF2F` & `MiniF2F-Lean4` MIT, `LeanDojo Benchmark`, `Lean-Workbook` Apache-2.0, `PutnamBench` Apache-2.0, `ProofNet-Lean4` MIT, `FormalMATH-Lite` MIT, and `NuminaMath-LEAN` Apache-2.0) alongside 15 open-source tools and research papers (`2018`–`2026`):
+- **Contamination & Training Guards**: Every dataset entry in `catalog/sources.json` carries explicit `domain` (`"sql"` or `"lean4"`), `release_year`, `eval_only`, and `training_allowed` flags enforced by `scripts/check_catalog.py` (`eval_only=true` requires `training_allowed=false`; custom/unverified `NOASSERTION` licenses default `training_allowed=false`).
+- **Execution-Grounded Open Benchmark Loaders (`src/lab_verify/open_benchmarks.py` & `scripts/fetch_open_benchmarks.py`)**:
+  - **SQL Gate Adapters (`verify_open_sql_item`, `evaluate_open_sql_batch`)**: Load `BIRD Mini-Dev`, `Spider 2.0-Lite` (`local*` SQLite instances), `EHRSQL-2024` (`annotated.json` or `data.json` + `label.json`), and `BIRD-CRITIC 1.0 SQLite` into read-only `mode=ro` SQLite connections (`open_readonly_db`), enforcing both 4-layer execution equivalence and clinical abstention gating on unanswerable `EHRSQL` questions (`is_unanswerable=True`).
+  - **Lean 4 Gate Adapters (`verify_open_lean_item`, `evaluate_open_lean_batch`)**: Load `Lean-Workbook`, `PutnamBench`, `ProofNet-Lean4`, `MiniF2F-Lean4`, `FormalMATH-Lite`, and `NuminaMath-LEAN` items into `lean_gate.verify_lean`, verifying exact theorem-signature preservation (`canonicalize_lean_statement`) and blocking `sorry`, `axiom`, `admit`, `native_decide`, `#exit`, and `opaque` bypasses.
+  - No external benchmark archives are committed to git; `scripts/fetch_open_benchmarks.py` downloads slices on demand into gitignored `data/open_benchmarks/` with SHA-256 provenance manifests.
 
 ---
 
@@ -85,6 +90,8 @@ On the 22-candidate suite:
 | Commit | Date | Author | Branch / Ref | Summary |
 |---|---|---|---|---|
 | `3255ec7` (`3255ec79775bb4127b0ffaead188147c6ac79229`) | `2026-11-18` | Yani Guan | `main` | Initial commit (`Add curated resources and first demo`): implemented the 4-layer SQL default-deny gate (`demo/sql_gate.py`) over a 30-row synthetic SQLite lab database, authored the 12-question / 22-candidate benchmark (`demo/candidates.json`, `demo/output.txt`), added CI (`.github/workflows/demo.yml`), linked `YLM` (`lean/`), and curated formal-verification and text-to-SQL benchmarks, repos, and papers (`2018`–`2026`). |
+| `a5f9aec` | `2026-11-25` | Yani Guan | `main` | Merged Phase-2 audit hardening (`PR #30`): Ed25519 role-separated co-signatures, bounded TTL/key-epoch checks, recursive CTE string-expansion guards, and `autolab_wire.py` (`autolab-wire/v1`) capability minting & daytime frontier deferral. |
+| `feat/open-datasets-2026` | `2026-11-25` | Yani Guan | `feat/open-datasets-2026` | Expanded `catalog/sources.json` (`v1.1.0`) with verified 2024–2026 open Text-to-SQL (`Spider 2.0-Lite`, `BIRD Mini-Dev`, `EHRSQL-2024`, `BIRD-CRITIC 1.0 SQLite`, `LiveSQLBench`) and Lean 4 (`Lean-Workbook`, `PutnamBench`, `ProofNet-Lean4`, `MiniF2F-Lean4`, `FormalMATH-Lite`, `NuminaMath-LEAN`) benchmarks, `eval_only`/`training_allowed` contamination guards, and execution-grounded `sql_gate`/`lean_gate` adapters (`src/lab_verify/open_benchmarks.py`, `scripts/fetch_open_benchmarks.py`, `tests/test_open_datasets_2026.py`). |
 
 ---
 

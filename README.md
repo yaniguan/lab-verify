@@ -13,7 +13,7 @@ In the [Auto-Lab](https://github.com/yaniguan/auto-lab) system ([yaniguan.github
 Full architectural documentation, verification-layer semantics, commit history, and sibling-repository contracts are maintained in [`docs/ARCHITECTURE_AND_HISTORY.md`](docs/ARCHITECTURE_AND_HISTORY.md):
 
 - **Object**: Default-deny mechanical verification gate (`L4`) auditing LLM-generated SQL queries, formal Lean 4 proofs (`YLM/lean`), and laboratory protocol outputs before database execution or benchtop dispatch.
-- **Data**: Deterministic 30-row **synthetic** in-memory SQLite lab database (`12` experiments, `14` samples, `4` instruments), `12` analytics questions with gold SQL and `22` labeled candidate queries (`8` correct, `14` error cases in `demo/candidates.json`), plus curated links to 5 text-to-SQL/Lean benchmarks and 11 open-source verification repos.
+- **Data**: Deterministic 30-row **synthetic** in-memory SQLite lab database (`12` experiments, `14` samples, `4` instruments), `12` analytics questions with gold SQL and `22` labeled candidate queries (`8` correct, `14` error cases in `demo/candidates.json`), plus verified 2024–2026 open-source Text-to-SQL and Lean 4 benchmark adapters (`src/lab_verify/open_benchmarks.py`, `scripts/fetch_open_benchmarks.py`) covering 16 cataloged SQL/Lean datasets and 15 open-source verification repos (`catalog/sources.json`).
 - **Model**: Four-layer sequential fail-fast SQL gate (`demo/sql_gate.py`): Layer 1 syntax parse (`sqlglot`), Layer 2 AST + SQLite `PRAGMA query_only` read-only enforcement, Layer 3 static table/column schema resolution, and Layer 4 execution multiset equivalence (`22/22` label agreement; catches `7/14` semantic errors missed by static layers 1–3). No neural model is trained here.
 - **Training**: Zero parametric training; deterministic symbolic/execution checker designed to gate runtime inference and supply verifiable pass/fail feedback to `L3` post-training (`labbench-posttrain`, `twinstep`).
 - **History**: Initialized in `3255ec7` (`2026-11-18`) with the 4-layer SQLite gate, 22-candidate benchmark suite, reference output, CI workflow, and formal/SQL literature map.
@@ -37,12 +37,14 @@ lab-verify/
 ├── schema/
 │   └── candidates.schema.json            # Strict JSON Schema for SQL candidate benchmarks
 ├── scripts/
-│   └── check_catalog.py                  # Automated SPDX license & markdown URL validator
+│   ├── check_catalog.py                  # Automated SPDX, eval_only/training & markdown URL validator
+│   └── fetch_open_benchmarks.py          # On-demand fetcher & smoke verifier for 2024-2026 SQL/Lean suites
 ├── src/lab_verify/
 │   ├── __init__.py                       # Unified verify() entry point and public API
 │   ├── cli.py                            # CLI (--sql, --lean, --protocol, mcp-mint, mcp-verify)
 │   ├── lean_gate.py                      # Lean 4 vacuity/sorry/axiom detector and lake toolchain runner
 │   ├── mcp_gate.py                       # Wire-compatible lean-mcp/v1 capability minting & stateful gate
+│   ├── open_benchmarks.py                # BIRD/Spider2/EHRSQL SQLite & LeanWorkbook/PutnamBench/ProofNet adapters
 │   ├── properties.py                     # Runtime semantic property checks (fanout, ranges, uniqueness)
 │   ├── protocol_gate.py                  # Benchtop protocol verifier compatible with lab-rehearsal/twinstep
 │   ├── sql_gate.py                       # Hardened 4-layer SQL gate + SQLite authorizer & progress timeout
@@ -51,6 +53,7 @@ lab-verify/
 │   ├── test_autolab_wire.py              # Auto-Lab 15-repo wire node (autolab-wire/v1) test suite
 │   ├── test_community_extensions.py      # Firewall & mutant-SQL counterexample benchmark tests
 │   ├── test_mcp_runtime_gate.py          # Zero-trust lean-mcp/v1 envelope, deferral & CLI test suite
+│   ├── test_open_datasets_2026.py        # Catalog SPDX/eval-only & 2024-2026 SQL/Lean adapter test suite
 │   └── test_sql_gate.py                  # 54-case unit & adversarial SQL/Lean/protocol red-team test suite
 ├── autolab_wire.py                       # Layer L4 autolab-wire/v1 node & stepbot capability minter
 ├── LICENSE                               # MIT License
@@ -135,32 +138,57 @@ lab-verify mcp-verify envelope.json --protocol run_script.py --state mcp_state.j
 - **Default-Deny SQL & `lean-mcp/v1` Minting (`L4` -> `L1` `stepbot`)**: `process_packet(packet)` runs the 4-layer read-only SQLite gate (`L4_VERIFY_SQL_BLOCK` on mutating or invalid SQL) and mints an HMAC-authenticated `lean-mcp/v1` capability envelope (`invariant="autonomous_wire_envelope_soundness"`). `mint_for_compiled_stepbot(packet)` binds `verification.mcp_envelope` to the exact compiled Opentrons Python SHA-256 and bounds emitted by [`stepbot`](https://github.com/yaniguan/stepbot) (`StepbotMcpExecutor`), gating physical actuation across [`stepbot`](https://github.com/yaniguan/stepbot), [`lab-hands`](https://github.com/yaniguan/lab-hands) (`L1`), and [`lab-feet`](https://github.com/yaniguan/lab-feet) (`L0`).
 - **Sibling `L4` Post-Run Partner ([`lab-attrib`](https://github.com/yaniguan/lab-attrib))**: Pairs pre-execution default-deny gates (`lab-rehearsal` + `lab-verify`) with post-execution causal blame, NNLS XRD precursor deconvolution, and SHA-256 certified ledger quarantine in [`lab-attrib`](https://github.com/yaniguan/lab-attrib) before verified runs reach [`twinstep`](https://github.com/yaniguan/twinstep), [`labfill`](https://github.com/yaniguan/labfill), and [`labbench-posttrain`](https://github.com/yaniguan/labbench-posttrain) (`L3`).
 
+## 2024–2026 Open SQL & Lean 4 Benchmark Adapters
+
+`lab_verify.open_benchmarks` and `scripts/fetch_open_benchmarks.py` load open-source clinical, scientific, and enterprise Text-to-SQL items directly into the 4-layer read-only `sql_gate` (`mode=ro` SQLite + `PRAGMA query_only` + clinical abstention checks on unanswerable `EHRSQL` queries) and formal mathematics items into `lean_gate` (enforcing exact benchmark theorem-signature preservation and zero `sorry`, `axiom`, `admit`, `native_decide`, `#exit`, or `opaque` bypasses). Every dataset entry in `catalog/sources.json` records exact SPDX licensing plus `eval_only` and `training_allowed` flags so evaluation-only suites are never mixed into `L3` post-training.
+
+```bash
+python scripts/fetch_open_benchmarks.py --list
+python scripts/fetch_open_benchmarks.py --offline-demo
+python scripts/fetch_open_benchmarks.py --dataset bird-mini-dev-hf --max-items 25 --verify
+```
+
 ## Datasets
 
-| Dataset | What | License |
-|---|---|---|
-| [Spider](https://yale-lily.github.io/spider) | Cross-domain text-to-SQL | CC BY-SA 4.0 |
-| [BIRD](https://bird-bench.github.io/) | Large database-grounded text-to-SQL | CC BY-SA 4.0 |
-| [Spider 2.0](https://spider2-sql.github.io/) | Enterprise text-to-SQL workflows | MIT (code) |
-| [miniF2F](https://github.com/facebookresearch/miniF2F) | Formal olympiad math statements | MIT |
-| [LeanDojo Benchmark](https://leandojo.org/) | Theorems and proofs from mathlib | See project site |
+| Dataset | Domain | Year | What | License | Eval-Only |
+|---|---|---:|---|---|---|
+| [Spider](https://yale-lily.github.io/spider) | SQL | 2018 | Cross-domain text-to-SQL | CC BY-SA 4.0 | No |
+| [BIRD](https://bird-bench.github.io/) | SQL | 2023 | Large database-grounded text-to-SQL | CC BY-SA 4.0 | No |
+| [Spider 2.0](https://spider2-sql.github.io/) | SQL | 2025 | Enterprise text-to-SQL workflows | MIT | Yes |
+| [Spider 2.0-Lite](https://huggingface.co/datasets/xlangai/spider2-lite) | SQL | 2025 | Self-contained enterprise & local SQLite (`local*`) text-to-SQL | MIT | Yes |
+| [BIRD Mini-Dev](https://huggingface.co/datasets/birdsql/bird_mini_dev) | SQL | 2024 | 500 curated SQLite/PostgreSQL/MySQL queries with domain evidence | CC BY-SA 4.0 | Yes |
+| [EHRSQL-2024](https://github.com/glee4810/ehrsql-2024) | SQL | 2024 | Clinical MIMIC-IV read-only SQLite queries + unanswerable abstention | CC BY 4.0 | No |
+| [BIRD-CRITIC 1.0 SQLite](https://huggingface.co/datasets/birdsql/bird-critic-1.0-sqlite) | SQL | 2025 | Real-world SQLite diagnostic and user SQL issue repair (`SWE-SQL`) | CC BY-SA 4.0 | Yes |
+| [LiveSQLBench Base-Lite SQLite](https://huggingface.co/datasets/birdsql/livesqlbench-base-lite-sqlite) | SQL | 2025 | Contamination-free dynamic SQLite text-to-SQL with hierarchical KBs | CC BY-SA 4.0 | Yes |
+| [miniF2F](https://github.com/facebookresearch/miniF2F) | Lean 4 | 2022 | Formal olympiad math statements | MIT | Yes |
+| [LeanDojo Benchmark](https://leandojo.org/) | Lean 4 | 2023 | Theorems and proofs extracted from mathlib | See project site | No |
+| [Lean-Workbook](https://huggingface.co/datasets/internlm/Lean-Workbook) | Lean 4 | 2024 | 57K+ Lean 4 formal-informal math problem pairs and verified tactics | Apache-2.0 | No |
+| [PutnamBench (Lean 4)](https://github.com/trishullab/PutnamBench) | Lean 4 | 2024 | William Lowell Putnam competition problems formalized in Lean 4 | Apache-2.0 | Yes |
+| [ProofNet-Lean4](https://github.com/rahul3613/ProofNet-lean4) | Lean 4 | 2024 | Undergraduate pure mathematics benchmark ported to Lean 4 + Mathlib4 | MIT | Yes |
+| [MiniF2F-Lean4](https://huggingface.co/datasets/cat-searcher/minif2f-lean4) | Lean 4 | 2024 | Lean 4 + Mathlib4 port of the 488-problem Olympiad benchmark | MIT | Yes |
+| [FormalMATH-Lite](https://huggingface.co/datasets/SphereLab/FormalMATH-Lite) | Lean 4 | 2025 | Verified Lean 4 Olympiad and undergraduate theorem benchmark | MIT | Yes |
+| [NuminaMath-LEAN](https://huggingface.co/datasets/AI-MO/NuminaMath-LEAN) | Lean 4 | 2025 | 104K competition math problems formalized in Lean 4 with RLVR proofs | Apache-2.0 | No |
 
 ## Open-source repos
 
-Stars as of 2026-11-18.
+Stars as of 2026-11-25.
 
 | Repo | What | Stars | License |
 |---|---|---:|---|
 | [leanprover/lean4](https://github.com/leanprover/lean4) | Lean 4 programming language and theorem prover | 10,046 | Apache-2.0 |
 | [tobymao/sqlglot](https://github.com/tobymao/sqlglot) | Python SQL Parser and Transpiler | 9,800 | MIT |
 | [leanprover-community/mathlib4](https://github.com/leanprover-community/mathlib4) | The math library of Lean 4 | 4,498 | Apache-2.0 |
-| [deepseek-ai/DeepSeek-Prover-V2](https://github.com/deepseek-ai/DeepSeek-Prover-V2) | - | 1,330 | custom (see repo) |
-| [xlang-ai/Spider2](https://github.com/xlang-ai/Spider2) | [ICLR 2025 Oral] Spider 2.0: Evaluating Language Models on Real-World Enterprise... | 889 | MIT |
+| [deepseek-ai/DeepSeek-Prover-V2](https://github.com/deepseek-ai/DeepSeek-Prover-V2) | Lean 4 subgoal-decomposition theorem prover | 1,330 | custom (see repo) |
+| [bird-bench/BIRD-CRITIC-1](https://github.com/bird-bench/BIRD-CRITIC-1) | BIRD-CRITIC (`SWE-SQL`) SQL diagnostic and repair harness | 1,107 | MIT |
+| [xlang-ai/Spider2](https://github.com/xlang-ai/Spider2) | [ICLR 2025 Oral] Spider 2.0: Evaluating Language Models on Real-World Enterprise... | 893 | MIT |
 | [lean-dojo/LeanDojo](https://github.com/lean-dojo/LeanDojo) | Tool for data extraction and interacting with Lean programmatically. | 853 | MIT |
 | [leanprover-community/physlib](https://github.com/leanprover-community/physlib) | A project to digitalise results from physics into Lean. | 840 | Apache-2.0 |
-| [bird-bench/mini_dev](https://github.com/bird-bench/mini_dev) | - | 195 | no license file |
+| [InternLM/InternLM-Math](https://github.com/InternLM/InternLM-Math) | Lean 4 formal math models and `Lean-Workbook` autoformalization tools | 553 | Apache-2.0 |
+| [bird-bench/mini_dev](https://github.com/bird-bench/mini_dev) | Compact evaluation code for BIRD Mini-Dev | 197 | no license file |
 | [autoprotocol/autoprotocol-python](https://github.com/autoprotocol/autoprotocol-python) | Python library for generating Autoprotocol | 126 | custom (see repo) |
+| [glee4810/EHRSQL](https://github.com/glee4810/EHRSQL) | Practical clinical Electronic Health Record text-to-SQL benchmark | 117 | CC BY 4.0 |
 | [facebookresearch/miniF2F](https://github.com/facebookresearch/miniF2F) | An updated version of miniF2F with lots of fixes and informal statements / solutions. | 108 | MIT |
+| [Sphere-AI-Lab/FormalMATH-Bench](https://github.com/Sphere-AI-Lab/FormalMATH-Bench) | Evaluation harness for the `FormalMATH` Lean 4 benchmark | 76 | Apache-2.0 |
 | [Bioprotocols/labop](https://github.com/Bioprotocols/labop) | Laboratory Open Protocol (LabOP) Language | 55 | MIT |
 
 ## Papers
