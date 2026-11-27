@@ -377,14 +377,23 @@ def test_issue_13_14_benchmark_parity_schema_and_gold_validation(tmp_path):
 
 # ---- Issue #15: Unified VerifyVerdict, Lean 4 checker, and Protocol checker ----
 def test_issue_15_unified_verdict_lean_and_protocol_checkers():
-    # 1. Clean Lean 4 code (even with 'sorry' mentioned inside a comment!) passes
+    import shutil
+
+    # 1. Clean Lean 4 code passes static_only=True, and compiles live when Lean 4 is installed
     clean_lean = """
     -- Proven without sorry or native_decide
     /- Block comment mentioning axiom and admit -/
     theorem add_zero_right (n : Nat) : n + 0 = n := by rfl
     """
-    v_ok = verify("lean", clean_lean)
-    assert isinstance(v_ok, VerifyVerdict) and v_ok.passed is True
+    v_static = verify("lean", clean_lean, static_only=True)
+    assert isinstance(v_static, VerifyVerdict) and v_static.passed is True
+    assert v_static.reason == "static_only"
+    if shutil.which("lean") is not None:
+        v_live = verify("lean", clean_lean)
+        assert v_live.passed is True
+    else:
+        v_missing = verify("lean", clean_lean)
+        assert v_missing.passed is False
 
     # 2. Sorry, native_decide, custom axiom, and vacuous theorems are rejected
     for bad_lean in [
@@ -394,7 +403,7 @@ def test_issue_15_unified_verdict_lean_and_protocol_checkers():
         "theorem vacuous : True := trivial",
         "theorem ex_falso : False -> 1 = 2 := False.elim",
     ]:
-        v_bad = verify_lean(bad_lean)
+        v_bad = verify_lean(bad_lean, static_only=True)
         assert v_bad.passed is False
 
     # 3. Protocol gate checks valid & broken protocols
@@ -726,3 +735,152 @@ def test_issue_29_unordered_float_sort_cliff_bipartite_matching_and_symmetry():
         is None
     )
     assert (time.perf_counter() - t0) < 1.0
+
+
+# ---- Issue #33: Comma joins, scalar CTE CROSS JOIN, tie-aware ORDER BY, & 50,000-row limits ----
+def test_issue_33_comma_joins_scalar_cte_cross_join_ties_and_50k_rows(db, tmp_path):
+    from lab_verify.cli import main as cli_main
+
+    # 1. Comma join linked in WHERE passes; unlinked comma join still fails Layer 3
+    gold_join = "SELECT e.id, s.well FROM experiments e JOIN samples s ON e.id = s.experiment_id"
+    comma_linked = "SELECT e.id, s.well FROM experiments e, samples s WHERE e.id = s.experiment_id"
+    v_comma = verify_sql(db, comma_linked, gold_sql=gold_join)
+    assert v_comma.passed is True
+
+    v_unlinked = verify_sql(db, "SELECT e.id, s.well FROM experiments e, samples s")
+    assert v_unlinked.passed is False and v_unlinked.layer == "schema"
+
+    # 2. CROSS JOIN with a scalar CTE passes; base-table CROSS JOIN without allow_cross_join fails
+    scalar_cross = (
+        "WITH avg_y AS (SELECT AVG(yield_pct) AS mean_y FROM experiments) "
+        "SELECT e.id FROM experiments e CROSS JOIN avg_y WHERE e.yield_pct > avg_y.mean_y"
+    )
+    gold_subq = (
+        "SELECT id FROM experiments WHERE yield_pct > (SELECT AVG(yield_pct) FROM experiments)"
+    )
+    assert verify_sql(db, scalar_cross, gold_sql=gold_subq).passed is True
+    assert (
+        verify_sql(db, "SELECT e.id, i.name FROM experiments e CROSS JOIN instruments i").passed
+        is False
+    )
+
+    # 3. Tie-aware ORDER BY: tie-breaking on equal sort keys passes; wrong primary order fails
+    gold_tied = "SELECT id, operator, yield_pct FROM experiments WHERE status = 'done' ORDER BY operator"
+    cand_tiebreak = (
+        "SELECT id, operator, yield_pct FROM experiments WHERE status = 'done' "
+        "ORDER BY operator, id DESC"
+    )
+    cand_wrong_order = (
+        "SELECT id, operator, yield_pct FROM experiments WHERE status = 'done' "
+        "ORDER BY yield_pct ASC"
+    )
+    assert verify_sql(db, cand_tiebreak, gold_sql=gold_tied).passed is True
+    v_wrong_ord = verify_sql(db, cand_wrong_order, gold_sql=gold_tied)
+    assert v_wrong_ord.passed is False and v_wrong_ord.layer == "execution"
+
+    # LIMIT-cut tie marks valid alternative tie winner as "ambiguous_gold" instead of false-rejecting
+    tie_db = sqlite3.connect(":memory:")
+    tie_db.execute("CREATE TABLE scores (id INTEGER PRIMARY KEY, val REAL)")
+    tie_db.executemany("INSERT INTO scores VALUES (?, ?)", [(1, 90.0), (2, 90.0), (3, 80.0)])
+    try:
+        v_limit_tie = verify_sql(
+            tie_db,
+            "SELECT id, val FROM scores ORDER BY val DESC, id DESC LIMIT 1",
+            gold_sql="SELECT id, val FROM scores ORDER BY val DESC LIMIT 1",
+            schema={"scores": ["id", "val"]},
+        )
+        assert v_limit_tie.passed is True
+        assert v_limit_tie.reason == "ambiguous_gold"
+
+        v_limit_bad = verify_sql(
+            tie_db,
+            "SELECT id, val FROM scores ORDER BY val ASC LIMIT 1",
+            gold_sql="SELECT id, val FROM scores ORDER BY val DESC LIMIT 1",
+            schema={"scores": ["id", "val"]},
+        )
+        assert v_limit_bad.passed is False
+    finally:
+        tie_db.close()
+
+    # 4. Configurable limits handle a 50,000-row `schools` table via Python API and CLI
+    big_db = tmp_path / "schools_50k.sqlite"
+    wcon = sqlite3.connect(big_db)
+    wcon.execute("CREATE TABLE schools (id INTEGER PRIMARY KEY, district TEXT, enrollment INTEGER)")
+    wcon.executemany(
+        "INSERT INTO schools VALUES (?, ?, ?)",
+        [(i, f"D{i % 20}", 200 + (i % 500)) for i in range(1, 50_001)],
+    )
+    wcon.commit()
+    wcon.close()
+
+    rcon, big_schema = open_readonly_db(big_db)
+    try:
+        v_default_cap = verify_sql(rcon, "SELECT id, enrollment FROM schools", schema=big_schema)
+        assert v_default_cap.passed is False and "max_rows cap" in v_default_cap.reason
+
+        v_raised = verify_sql(
+            rcon,
+            "SELECT id, enrollment FROM schools",
+            gold_sql="SELECT id, enrollment FROM schools WHERE id >= 1",
+            schema=big_schema,
+            max_rows=60_000,
+            max_vm_steps=25_000_000,
+            timeout_s=5.0,
+        )
+        assert v_raised.passed is True
+    finally:
+        rcon.close()
+
+    rc_cli_50k = cli_main(
+        [
+            "--db",
+            str(big_db),
+            "--sql",
+            "SELECT id, enrollment FROM schools",
+            "--gold",
+            "SELECT id, enrollment FROM schools",
+            "--max-rows",
+            "60000",
+            "--max-vm-steps",
+            "25000000",
+            "--json",
+        ]
+    )
+    assert rc_cli_50k == 0
+
+
+# ---- Issue #35: q4 NULL-unsafe average caught & ISO YYYY-MM-DD date CHECK enforced ----
+def test_issue_35_q4_null_unsafe_average_caught_and_iso_date_check(db, ce_dbs):
+    from lab_verify.sql_gate import DDL_STATEMENTS
+
+    # 1. q4 candidate `SUM(yield_pct) / COUNT(*)` is labeled wrong and caught by counterexample DB #3
+    cands = json.loads((REPO_ROOT / "demo" / "candidates.json").read_text(encoding="utf-8"))
+    q4 = next(item for item in cands if item["qid"] == 4)
+    q4_null_cand = next(
+        c for c in q4["candidates"] if "COUNT(*)" in c["sql"]
+    )
+    assert q4_null_cand["label"] == "NULL-unsafe average"
+
+    v_q4 = verify_sql(
+        db,
+        q4_null_cand["sql"],
+        gold_sql=q4["gold"],
+        counterexample_cons=ce_dbs,
+    )
+    assert v_q4.passed is False
+    assert v_q4.layer == "execution"
+    assert "counterexample db" in v_q4.reason
+
+    # 2. DDL enforces ISO YYYY-MM-DD format so q12 string comparison `date >= '2026-03-01'` is sound
+    mem = sqlite3.connect(":memory:")
+    for ddl in DDL_STATEMENTS:
+        mem.execute(ddl)
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            mem.execute(
+                "INSERT INTO experiments VALUES (99, '2026-3-5', 'Kim', 'PCR', 37.0, 90.0, 'done', NULL)"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            mem.execute("INSERT INTO instruments VALUES (99, 'BadCal', '03/05/2026')")
+    finally:
+        mem.close()

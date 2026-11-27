@@ -1,11 +1,11 @@
 """Idea #13: Adversarial Counterexample SQLite DB Synthesizer.
 
-Inspired by BenchBench-Protocol (arXiv:2608.23898). Evaluating LLM-generated laboratory
-SQL queries against a single clean seed SQLite database allows subtle semantic bugs
-(missing DISTINCT under 1:N joins, INNER vs LEFT JOIN on empty strata, SUM/COUNT(*) vs
-AVG NULL traps, != dropping NULLs, < vs <= boundary off-by-ones, missing ORDER BY
-tie-breakers, and case-sensitive string predicates) to slip through undetected whenever
-the seed DB happens to be 1-to-1, non-null, and uniquely valued.
+Evaluating LLM-generated laboratory SQL queries against a single clean seed SQLite
+database allows subtle semantic bugs (missing DISTINCT under 1:N joins, INNER vs LEFT
+JOIN on empty strata, SUM/COUNT(*) vs AVG NULL traps, != dropping NULLs, < vs <=
+boundary off-by-ones, missing ORDER BY tie-breakers, and case-sensitive string
+predicates) to slip through undetected whenever the seed DB happens to be 1-to-1,
+non-null, and uniquely valued.
 
 Given any clean SQLite seed database, `synthesize_five_sqlite_mutants` introspects
 `sqlite_master`, `PRAGMA table_info`, and `PRAGMA foreign_key_list` to automatically
@@ -15,10 +15,11 @@ with a strict read-only SQLite authorizer before executing candidate SQL.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
+import re
 import sqlite3
 import sys
-from dataclasses import dataclass
 from typing import Any
 
 _SRC_DIR = Path(__file__).resolve().parents[1] / "src"
@@ -31,6 +32,8 @@ from lab_verify.sql_gate import (  # noqa: E402
     compare_results,
     run,
 )
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 ALLOWED_READONLY_ACTIONS: frozenset[int] = frozenset(
     {
@@ -107,39 +110,56 @@ class MutantGateVerdict:
     error_detail: str | None = None
 
 
+def _is_iso_date_text(val: Any) -> bool:
+    return isinstance(val, str) and bool(_ISO_DATE_RE.match(val))
+
+
 def _introspect_seed_db(seed_conn: sqlite3.Connection) -> list[TableMeta]:
-    cur = seed_conn.cursor()
-    tbl_rows = cur.execute(
-        "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-    ).fetchall()
-    tables: list[TableMeta] = []
-    for tbl_name, create_sql in tbl_rows:
-        col_info = cur.execute(f'PRAGMA table_info("{tbl_name}")').fetchall()
-        cols = tuple(
-            ColumnMeta(
-                name=str(c[1]),
-                col_type=str(c[2] or "").upper(),
-                notnull=bool(c[3]),
-                is_pk=bool(c[5]),
+    prev_auth = None
+    try:
+        seed_conn.set_authorizer(lambda *_a: sqlite3.SQLITE_OK)
+        prev_auth = True
+    except sqlite3.Error:
+        prev_auth = False
+    try:
+        cur = seed_conn.cursor()
+        tbl_rows = cur.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        tables: list[TableMeta] = []
+        for tbl_name, create_sql in tbl_rows:
+            col_info = cur.execute(f'PRAGMA table_info("{tbl_name}")').fetchall()
+            cols = tuple(
+                ColumnMeta(
+                    name=str(c[1]),
+                    col_type=str(c[2] or "").upper(),
+                    notnull=bool(c[3]),
+                    is_pk=bool(c[5]),
+                )
+                for c in col_info
             )
-            for c in col_info
-        )
-        fk_info = cur.execute(f'PRAGMA foreign_key_list("{tbl_name}")').fetchall()
-        fks = tuple(
-            ForeignKeyMeta(from_col=str(f[3]), ref_table=str(f[2]), ref_col=str(f[4]))
-            for f in fk_info
-        )
-        data_rows = tuple(cur.execute(f'SELECT * FROM "{tbl_name}"').fetchall())
-        tables.append(
-            TableMeta(
-                name=tbl_name,
-                create_sql=str(create_sql),
-                columns=cols,
-                foreign_keys=fks,
-                rows=data_rows,
+            fk_info = cur.execute(f'PRAGMA foreign_key_list("{tbl_name}")').fetchall()
+            fks = tuple(
+                ForeignKeyMeta(from_col=str(f[3]), ref_table=str(f[2]), ref_col=str(f[4]))
+                for f in fk_info
             )
-        )
-    return tables
+            data_rows = tuple(cur.execute(f'SELECT * FROM "{tbl_name}"').fetchall())
+            tables.append(
+                TableMeta(
+                    name=tbl_name,
+                    create_sql=str(create_sql),
+                    columns=cols,
+                    foreign_keys=fks,
+                    rows=data_rows,
+                )
+            )
+        return tables
+    finally:
+        if prev_auth:
+            try:
+                seed_conn.set_authorizer(_readonly_authorizer)
+            except sqlite3.Error:
+                pass
 
 
 def _topological_tables(tables: list[TableMeta]) -> list[TableMeta]:
@@ -210,7 +230,8 @@ def synthesize_five_sqlite_mutants(
     m1.commit()
     mutants["mutant_1_duplicate_join_keys"] = m1
 
-    # Mutant 2: NULL measurement & status cells (exposes AVG vs SUM/COUNT(*), != NULL traps)
+    # Mutant 2: NULL measurement & status cells across every filtered categorical value
+    # (exposes AVG vs SUM/COUNT(*) per category, e.g. WHERE protocol = 'ELISA', and != NULL traps)
     m2 = _clone_tables_into_memory(tables)
     new_fk_ids: dict[tuple[str, str], Any] = {}
     for t in tables:
@@ -219,6 +240,8 @@ def synthesize_five_sqlite_mutants(
         pk_cols = [c.name for c in t.columns if c.is_pk]
         nullable_cols = [c for c in t.columns if not c.notnull and not c.is_pk]
         fk_col_names = {fk.from_col for fk in t.foreign_keys}
+        nullable_non_fk = [c for c in nullable_cols if c.name not in fk_col_names]
+
         if len(pk_cols) == 1 and (nullable_cols or t.foreign_keys):
             pk = pk_cols[0]
             row_map = dict(zip((c.name for c in t.columns), t.rows[-1]))
@@ -232,16 +255,37 @@ def synthesize_five_sqlite_mutants(
                     continue
                 if not c.notnull:
                     row_map[c.name] = None
-                elif "CHAR" in c.col_type or "TEXT" in c.col_type:
+                elif ("CHAR" in c.col_type or "TEXT" in c.col_type) and not _is_iso_date_text(row_map[c.name]):
                     row_map[c.name] = f"{row_map[c.name]}_NULLPROBE"
             _insert_row_dict(m2, t, row_map)
             new_fk_ids[(t.name, pk)] = new_id
+
+            # Inject a NULL-measurement row for every distinct value of each non-date categorical column
+            if nullable_non_fk:
+                col_names = [c.name for c in t.columns]
+                for c_idx, c in enumerate(t.columns):
+                    if c.is_pk or c.name in fk_col_names or not c.notnull:
+                        continue
+                    if "CHAR" not in c.col_type and "TEXT" not in c.col_type:
+                        continue
+                    seen_vals: set[str] = set()
+                    for orig_row in t.rows:
+                        raw_val = orig_row[c_idx]
+                        if not isinstance(raw_val, str) or _is_iso_date_text(raw_val):
+                            continue
+                        if raw_val in seen_vals:
+                            continue
+                        seen_vals.add(raw_val)
+                        cat_row = dict(zip(col_names, orig_row))
+                        cat_row[pk] = _next_int_pk(m2, t, pk)
+                        for nc in nullable_non_fk:
+                            cat_row[nc.name] = None
+                        _insert_row_dict(m2, t, cat_row)
     m2.commit()
     mutants["mutant_2_null_measurement_cells"] = m2
 
     # Mutant 3: Exact boundary & tie-breaking rows (exposes < vs <= and missing ORDER BY tie-breaks)
     m3 = _clone_tables_into_memory(tables)
-    # Gather threshold-like REAL values from root/parent tables
     parent_reals: list[float] = []
     for rt in root_tables:
         for c_idx, c in enumerate(rt.columns):
@@ -251,7 +295,6 @@ def synthesize_five_sqlite_mutants(
                         parent_reals.append(float(r[c_idx]))
     boundary_val = parent_reals[0] if parent_reals else 100.0
 
-    # Insert two rows into child entity -> leaf chain: one at exact boundary_val, one tying row[0]
     if fk_tables:
         leaf_tbl = fk_tables[-1]
         mid_tbl = fk_tables[0] if len(fk_tables) > 1 else None
@@ -265,6 +308,8 @@ def synthesize_five_sqlite_mutants(
                 fk_names = {fk.from_col for fk in mid_tbl.foreign_keys}
                 for c in mid_tbl.columns:
                     if not c.is_pk and c.name not in fk_names and "TEXT" in c.col_type:
+                        if _is_iso_date_text(m_row[c.name]):
+                            continue
                         if str(m_row[c.name]).isupper() and len(str(m_row[c.name])) <= 8 and "-" not in str(m_row[c.name]):
                             continue
                         m_row[c.name] = tag
@@ -298,6 +343,8 @@ def synthesize_five_sqlite_mutants(
                 fk_names = {fk.from_col for fk in t.foreign_keys}
                 for c in t.columns:
                     if not c.is_pk and c.name not in fk_names and "TEXT" in c.col_type:
+                        if _is_iso_date_text(orphan_parent[c.name]):
+                            continue
                         orphan_parent[c.name] = f"EMPTY_STRATA_{orphan_parent[pk]}"
                 _insert_row_dict(m4, t, orphan_parent)
     m4.commit()
@@ -322,6 +369,8 @@ def synthesize_five_sqlite_mutants(
                     continue
                 if "TEXT" in c.col_type and isinstance(variant[c.name], str):
                     s_val = variant[c.name]
+                    if _is_iso_date_text(s_val):
+                        continue
                     if "-" in s_val:
                         variant[c.name] = f"{s_val}-CASE"
                     else:
@@ -353,7 +402,7 @@ def evaluate_sql_against_mutants(
     except (ExecutionLimitError, sqlite3.Error) as exc:
         return MutantGateVerdict(False, False, ("seed_execution_error",), str(exc))
 
-    seed_err = compare_results(cand_seed, gold_seed)
+    seed_err = compare_results(cand_seed, gold_seed, con=seed_conn, gold_sql=gold_sql)
     if seed_err is not None:
         return MutantGateVerdict(False, False, ("seed_db_mismatch",), seed_err)
 
@@ -364,7 +413,7 @@ def evaluate_sql_against_mutants(
             cand_res = run(m_conn, candidate_sql)
         except (ExecutionLimitError, sqlite3.Error) as exc:
             return MutantGateVerdict(True, False, (m_name,), str(exc))
-        if compare_results(cand_res, gold_res) is not None:
+        if compare_results(cand_res, gold_res, con=m_conn, gold_sql=gold_sql) is not None:
             failing.append(m_name)
 
     return MutantGateVerdict(
@@ -418,8 +467,8 @@ def build_clean_lims_seed_db(*, lock_readonly: bool = False) -> sqlite3.Connecti
     return conn
 
 
-def _build_24_sql_candidates() -> list[SqlBenchmarkCandidate]:
-    """6 gold SQL queries + 18 subtle semantic-bug SQL queries that pass on the clean seed DB."""
+def build_sql_benchmark_candidates() -> list[SqlBenchmarkCandidate]:
+    """14 genuine non-identical equivalent SQL rewrites + 18 semantic-bug SQL queries across 6 LIMS tasks."""
     g1 = (
         "SELECT p.plate_id, COUNT(DISTINCT s.sample_id) AS n_samples "
         "FROM plates p LEFT JOIN samples s ON p.plate_id = s.plate_id "
@@ -460,8 +509,36 @@ def _build_24_sql_candidates() -> list[SqlBenchmarkCandidate]:
     )
 
     return [
-        # Task 1 (1 gold + 3 bugs)
-        SqlBenchmarkCandidate("Q01-GOLD", "plate_sample_counts", g1, g1, True, "gold"),
+        # Task 1 (3 non-identical equivalent rewrites + 3 bugs)
+        SqlBenchmarkCandidate(
+            "Q01A-REWRITE-CORR-SUBQUERY",
+            "plate_sample_counts",
+            "SELECT p.plate_id, (SELECT COUNT(*) FROM samples s WHERE s.plate_id = p.plate_id) AS n_samples "
+            "FROM plates p ORDER BY p.plate_id ASC",
+            g1,
+            True,
+            "equivalent_rewrite",
+        ),
+        SqlBenchmarkCandidate(
+            "Q01B-REWRITE-CTE-AGG",
+            "plate_sample_counts",
+            "WITH per_plate AS (SELECT plate_id, COUNT(sample_id) AS cnt FROM samples GROUP BY plate_id) "
+            "SELECT p.plate_id, COALESCE(pp.cnt, 0) AS n_samples "
+            "FROM plates p LEFT JOIN per_plate pp ON pp.plate_id = p.plate_id ORDER BY p.plate_id",
+            g1,
+            True,
+            "equivalent_rewrite",
+        ),
+        SqlBenchmarkCandidate(
+            "Q01C-REWRITE-LEFT-JOIN-USING",
+            "plate_sample_counts",
+            "SELECT p.plate_id, COUNT(s.sample_id) AS n_samples "
+            "FROM plates AS p LEFT OUTER JOIN samples AS s USING (plate_id) "
+            "GROUP BY p.plate_id ORDER BY 1",
+            g1,
+            True,
+            "equivalent_rewrite",
+        ),
         SqlBenchmarkCandidate(
             "Q02-BUG-COUNT-NO-DISTINCT",
             "plate_sample_counts",
@@ -493,8 +570,32 @@ def _build_24_sql_candidates() -> list[SqlBenchmarkCandidate]:
             False,
             "count_star_on_left_join",
         ),
-        # Task 2 (1 gold + 3 bugs)
-        SqlBenchmarkCandidate("Q05-GOLD", "campaign_mean_rfu", g2, g2, True, "gold"),
+        # Task 2 (2 non-identical equivalent rewrites + 3 bugs)
+        SqlBenchmarkCandidate(
+            "Q05A-REWRITE-CASE-SUM-COUNT",
+            "campaign_mean_rfu",
+            "SELECT p.campaign, "
+            "CASE WHEN COUNT(r.signal_rfu) = 0 THEN 0.0 ELSE SUM(r.signal_rfu) * 1.0 / COUNT(r.signal_rfu) END AS mean_rfu "
+            "FROM plates p LEFT JOIN samples s ON s.plate_id = p.plate_id "
+            "LEFT JOIN readouts r ON r.sample_id = s.sample_id "
+            "GROUP BY p.campaign ORDER BY p.campaign ASC",
+            g2,
+            True,
+            "equivalent_rewrite",
+        ),
+        SqlBenchmarkCandidate(
+            "Q05B-REWRITE-CTE-IFNULL",
+            "campaign_mean_rfu",
+            "WITH camp_signals AS ("
+            "  SELECT p.campaign AS camp, r.signal_rfu AS sig "
+            "  FROM plates p LEFT OUTER JOIN samples s ON p.plate_id = s.plate_id "
+            "  LEFT OUTER JOIN readouts r ON s.sample_id = r.sample_id"
+            ") SELECT camp AS campaign, IFNULL(AVG(sig), 0.0) AS mean_rfu "
+            "FROM camp_signals GROUP BY camp ORDER BY camp",
+            g2,
+            True,
+            "equivalent_rewrite",
+        ),
         SqlBenchmarkCandidate(
             "Q06-BUG-SUM-DIV-COUNT-STAR",
             "campaign_mean_rfu",
@@ -528,8 +629,33 @@ def _build_24_sql_candidates() -> list[SqlBenchmarkCandidate]:
             False,
             "avg_coalesce_null_as_zero",
         ),
-        # Task 3 (1 gold + 3 bugs)
-        SqlBenchmarkCandidate("Q09-GOLD", "active_hits_above_thresh", g3, g3, True, "gold"),
+        # Task 3 (2 non-identical equivalent rewrites + 3 bugs)
+        SqlBenchmarkCandidate(
+            "Q09A-REWRITE-COMMA-JOIN",
+            "active_hits_above_thresh",
+            "SELECT s.compound_code, MAX(r.signal_rfu) AS peak_rfu "
+            "FROM plates p, samples s, readouts r "
+            "WHERE p.plate_id = s.plate_id AND s.sample_id = r.sample_id "
+            "AND LOWER(TRIM(r.qc_flag)) = 'pass' AND r.signal_rfu >= p.target_thresh "
+            "GROUP BY s.compound_code ORDER BY 2 DESC, 1 ASC",
+            g3,
+            True,
+            "equivalent_rewrite",
+        ),
+        SqlBenchmarkCandidate(
+            "Q09B-REWRITE-CTE-PASSING",
+            "active_hits_above_thresh",
+            "WITH passing_reads AS ("
+            "  SELECT sample_id, signal_rfu FROM readouts WHERE TRIM(UPPER(qc_flag)) = 'PASS'"
+            ") SELECT s.compound_code, MAX(pr.signal_rfu) AS peak_rfu "
+            "FROM samples s INNER JOIN plates p USING (plate_id) "
+            "INNER JOIN passing_reads pr USING (sample_id) "
+            "WHERE pr.signal_rfu >= p.target_thresh "
+            "GROUP BY s.compound_code ORDER BY MAX(pr.signal_rfu) DESC, s.compound_code ASC",
+            g3,
+            True,
+            "equivalent_rewrite",
+        ),
         SqlBenchmarkCandidate(
             "Q10-BUG-STRICT-GT-BOUNDARY",
             "active_hits_above_thresh",
@@ -566,8 +692,30 @@ def _build_24_sql_candidates() -> list[SqlBenchmarkCandidate]:
             False,
             "tie_breaking_order_bug",
         ),
-        # Task 4 (1 gold + 3 bugs)
-        SqlBenchmarkCandidate("Q13-GOLD", "non_failed_samples", g4, g4, True, "gold"),
+        # Task 4 (2 non-identical equivalent rewrites + 3 bugs)
+        SqlBenchmarkCandidate(
+            "Q13A-REWRITE-COALESCE-GROUP",
+            "non_failed_samples",
+            "SELECT s.sample_id, s.compound_code "
+            "FROM samples s LEFT OUTER JOIN readouts r ON r.sample_id = s.sample_id "
+            "WHERE COALESCE(UPPER(r.qc_flag), 'NONE') <> 'FAIL' "
+            "GROUP BY s.sample_id, s.compound_code ORDER BY s.sample_id ASC",
+            g4,
+            True,
+            "equivalent_rewrite",
+        ),
+        SqlBenchmarkCandidate(
+            "Q13B-REWRITE-EXISTS",
+            "non_failed_samples",
+            "SELECT s.sample_id, s.compound_code FROM samples s "
+            "WHERE NOT EXISTS (SELECT 1 FROM readouts r WHERE r.sample_id = s.sample_id) "
+            "OR EXISTS (SELECT 1 FROM readouts r WHERE r.sample_id = s.sample_id "
+            "AND (r.qc_flag IS NULL OR LOWER(r.qc_flag) != 'fail')) "
+            "ORDER BY s.sample_id",
+            g4,
+            True,
+            "equivalent_rewrite",
+        ),
         SqlBenchmarkCandidate(
             "Q14-BUG-NEQ-DROPS-NULL",
             "non_failed_samples",
@@ -600,8 +748,31 @@ def _build_24_sql_candidates() -> list[SqlBenchmarkCandidate]:
             False,
             "inner_vs_left_join",
         ),
-        # Task 5 (1 gold + 3 bugs)
-        SqlBenchmarkCandidate("Q17-GOLD", "top2_test_compounds", g5, g5, True, "gold"),
+        # Task 5 (2 non-identical equivalent rewrites + 3 bugs)
+        SqlBenchmarkCandidate(
+            "Q17A-REWRITE-HAVING",
+            "top2_test_compounds",
+            "SELECT s.compound_code, MAX(r.signal_rfu) AS best_rfu "
+            "FROM readouts r INNER JOIN samples s USING (sample_id) "
+            "WHERE LOWER(s.role) = 'test' "
+            "GROUP BY s.compound_code HAVING MAX(r.signal_rfu) IS NOT NULL "
+            "ORDER BY MAX(r.signal_rfu) DESC, s.compound_code ASC LIMIT 2",
+            g5,
+            True,
+            "equivalent_rewrite",
+        ),
+        SqlBenchmarkCandidate(
+            "Q17B-REWRITE-CTE-TEST",
+            "top2_test_compounds",
+            "WITH test_samples AS (SELECT sample_id, compound_code FROM samples WHERE UPPER(role) = 'TEST') "
+            "SELECT ts.compound_code, MAX(r.signal_rfu) AS best_rfu "
+            "FROM test_samples ts JOIN readouts r ON ts.sample_id = r.sample_id "
+            "WHERE r.signal_rfu IS NOT NULL "
+            "GROUP BY ts.compound_code ORDER BY 2 DESC, 1 ASC LIMIT 2",
+            g5,
+            True,
+            "equivalent_rewrite",
+        ),
         SqlBenchmarkCandidate(
             "Q18-BUG-CASE-SENSITIVE-ROLE",
             "top2_test_compounds",
@@ -635,8 +806,44 @@ def _build_24_sql_candidates() -> list[SqlBenchmarkCandidate]:
             False,
             "sum_fanout_vs_max",
         ),
-        # Task 6 (1 gold + 3 bugs)
-        SqlBenchmarkCandidate("Q21-GOLD", "qualified_compounds_per_plate", g6, g6, True, "gold"),
+        # Task 6 (3 non-identical equivalent rewrites + 3 bugs)
+        SqlBenchmarkCandidate(
+            "Q21A-REWRITE-CORR-SUBQUERY",
+            "qualified_compounds_per_plate",
+            "SELECT p.plate_id, ("
+            "  SELECT COUNT(DISTINCT s.compound_code) FROM samples s "
+            "  INNER JOIN readouts r ON r.sample_id = s.sample_id "
+            "  WHERE s.plate_id = p.plate_id AND r.signal_rfu >= 80.0"
+            ") AS n_qual FROM plates p ORDER BY p.plate_id ASC",
+            g6,
+            True,
+            "equivalent_rewrite",
+        ),
+        SqlBenchmarkCandidate(
+            "Q21B-REWRITE-CTE-QUAL",
+            "qualified_compounds_per_plate",
+            "WITH qual AS ("
+            "  SELECT s.plate_id, COUNT(DISTINCT s.compound_code) AS c "
+            "  FROM samples s JOIN readouts r ON s.sample_id = r.sample_id "
+            "  WHERE r.signal_rfu >= 80.0 GROUP BY s.plate_id"
+            ") SELECT p.plate_id, COALESCE(q.c, 0) AS n_qual "
+            "FROM plates p LEFT JOIN qual q ON q.plate_id = p.plate_id ORDER BY p.plate_id",
+            g6,
+            True,
+            "equivalent_rewrite",
+        ),
+        SqlBenchmarkCandidate(
+            "Q21C-REWRITE-DERIVED-SUBQUERY",
+            "qualified_compounds_per_plate",
+            "SELECT p.plate_id, COUNT(DISTINCT qs.compound_code) AS n_qual "
+            "FROM plates p LEFT OUTER JOIN ("
+            "  SELECT s.plate_id, s.compound_code FROM samples s, readouts r "
+            "  WHERE s.sample_id = r.sample_id AND r.signal_rfu >= 80.0"
+            ") qs ON qs.plate_id = p.plate_id GROUP BY p.plate_id ORDER BY 1",
+            g6,
+            True,
+            "equivalent_rewrite",
+        ),
         SqlBenchmarkCandidate(
             "Q22-BUG-CASE-COUNT-NO-DISTINCT",
             "qualified_compounds_per_plate",
@@ -677,17 +884,24 @@ def _build_24_sql_candidates() -> list[SqlBenchmarkCandidate]:
     ]
 
 
+_build_24_sql_candidates = build_sql_benchmark_candidates
+
+
 def run_benchmark() -> dict[str, Any]:
-    """Compare single_seed_db vs mutant_db_gate across 24 gold/buggy SQL candidates."""
+    """Compare single_seed_db vs mutant_db_gate across 14 equivalent SQL rewrites and 18 semantic bugs."""
     raw_seed = build_clean_lims_seed_db(lock_readonly=False)
     mutants = synthesize_five_sqlite_mutants(raw_seed, lock_readonly=True)
     raw_seed.set_authorizer(_readonly_authorizer)
 
-    candidates = _build_24_sql_candidates()
-    assert len(candidates) == 24
+    candidates = build_sql_benchmark_candidates()
+    gold_cands = [c for c in candidates if c.is_semantically_equivalent]
+    buggy_cands = [c for c in candidates if not c.is_semantically_equivalent]
+    assert len(gold_cands) == 14
+    assert len(buggy_cands) == 18
+    assert all(c.candidate_sql.strip() != c.gold_sql.strip() for c in gold_cands)
 
-    gold_total = sum(1 for c in candidates if c.is_semantically_equivalent)
-    buggy_total = sum(1 for c in candidates if not c.is_semantically_equivalent)
+    gold_total = len(gold_cands)
+    buggy_total = len(buggy_cands)
 
     seed_caught_bugs = 0
     seed_accepted_gold = 0
@@ -718,10 +932,15 @@ def run_benchmark() -> dict[str, Any]:
             m_conn.close()
         raw_seed.close()
 
+    seed_false_rejects = gold_total - seed_accepted_gold
+    mutant_false_rejects = gold_total - mutant_accepted_gold
+
     return {
         "benchmark": "idea_13_mutant_sql_synthesizer",
         "num_candidates": len(candidates),
         "gold_candidates": gold_total,
+        "equivalent_rewrite_candidates": gold_total,
+        "copied_gold_candidates": 0,
         "buggy_candidates": buggy_total,
         "num_mutants_per_schema": len(mutants),
         "single_seed_db": {
@@ -729,12 +948,16 @@ def run_benchmark() -> dict[str, Any]:
             "semantic_bug_catch_rate": round(seed_caught_bugs / buggy_total, 4),
             "gold_accepted": seed_accepted_gold,
             "gold_acceptance_rate": round(seed_accepted_gold / gold_total, 4),
+            "false_rejects": seed_false_rejects,
+            "false_reject_rate": round(seed_false_rejects / gold_total, 4),
         },
         "mutant_db_gate": {
             "semantic_bugs_caught": mutant_caught_bugs,
             "semantic_bug_catch_rate": round(mutant_caught_bugs / buggy_total, 4),
             "gold_accepted": mutant_accepted_gold,
             "gold_acceptance_rate": round(mutant_accepted_gold / gold_total, 4),
+            "false_rejects": mutant_false_rejects,
+            "false_reject_rate": round(mutant_false_rejects / gold_total, 4),
             "catches_by_mutant": catches_per_mutant,
         },
     }

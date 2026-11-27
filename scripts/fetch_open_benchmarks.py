@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -113,8 +114,14 @@ def fetch_benchmark_slice(
     return record
 
 
-def verify_downloaded_slice(dataset_id: str, slice_path: Path) -> dict[str, Any]:
-    """Run static gate sanity checks on a fetched SQL or Lean 4 slice."""
+def verify_downloaded_slice(
+    dataset_id: str,
+    slice_path: Path,
+    *,
+    project_dir: Path | None = None,
+    static_only: bool = False,
+) -> dict[str, Any]:
+    """Run SQL read-only and Lean 4 compilation / static soundness checks on a fetched slice."""
     spec = get_open_benchmark_spec(dataset_id)
     if spec.domain == "sql":
         if spec.format_kind == "livesqlbench_sqlite":
@@ -139,20 +146,42 @@ def verify_downloaded_slice(dataset_id: str, slice_path: Path) -> dict[str, Any]
         return {"dataset_id": spec.dataset_id, "items_parsed": 1, "status": "metadata_verified"}
     items = load_lean_benchmark_items(spec.dataset_id, slice_path)
     proved_valid = 0
+    compiled_count = 0
+    static_only_count = 0
     template_sorry_caught = 0
+    has_lean = shutil.which("lean") is not None
+    has_lake = shutil.which("lake") is not None
     for item in items:
         if item.reference_proof:
-            v = verify_open_lean_item(item, item.reference_proof)
+            needs_mathlib = "Mathlib" in item.header
+            can_compile = (
+                not static_only
+                and ((needs_mathlib and project_dir is not None and has_lake) or (not needs_mathlib and has_lean))
+            )
+            v = verify_open_lean_item(
+                item,
+                item.reference_proof,
+                static_only=not can_compile,
+                project_dir=project_dir if can_compile else None,
+            )
             if v.passed:
                 proved_valid += 1
+                if can_compile:
+                    compiled_count += 1
+                else:
+                    static_only_count += 1
         else:
-            v_raw = verify_open_lean_item(item, None)
+            v_raw = verify_open_lean_item(item, None, static_only=True)
             if not v_raw.passed:
                 template_sorry_caught += 1
+    mode = "lean_kernel" if (compiled_count > 0 and static_only_count == 0) else "static_only"
     return {
         "dataset_id": spec.dataset_id,
         "items_parsed": len(items),
+        "verification_mode": mode,
         "proved_passed_lean_gate": proved_valid,
+        "proved_compiled_kernel": compiled_count,
+        "proved_static_only": static_only_count,
         "unproved_templates_rejected": template_sorry_caught,
     }
 
@@ -240,6 +269,9 @@ def run_offline_smoke_suite() -> dict[str, Any]:
         ehr_abs_ok = verify_open_sql_item(ehr_db, ehr_items[1], "null")
 
         # 4. Lean-Workbook, PutnamBench, and ProofNet-Lean4 checks via lean_gate
+        # Mathlib items have no local Mathlib cache in zero-network smoke mode -> explicitly static_only;
+        # core-Lean items compile with Lean + `#print axioms` whenever `lean` is on PATH.
+        has_lean = shutil.which("lean") is not None
         lw_items = load_lean_benchmark_items(
             "lean-workbook",
             [
@@ -252,14 +284,18 @@ def run_offline_smoke_suite() -> dict[str, Any]:
                 }
             ],
         )
-        lw_proved = verify_open_lean_item(lw_items[0], lw_items[0].reference_proof)
-        lw_sorry = verify_open_lean_item(lw_items[0], "sorry")
+        lw_proved = verify_open_lean_item(lw_items[0], lw_items[0].reference_proof, static_only=True)
+        lw_sorry = verify_open_lean_item(lw_items[0], "sorry", static_only=True)
 
         pb_items = load_lean_benchmark_items(
             "putnambench",
-            "import Mathlib\n/-- Sum of two evens. -/\ntheorem putnam_demo (a b : Nat) : a + b = b + a :=\nsorry\n",
+            "import Init\n/-- Commutativity of natural addition. -/\ntheorem putnam_demo (a b : Nat) : a + b = b + a :=\nsorry\n",
         )
-        pb_proved = verify_open_lean_item(pb_items[0], assemble_lean_submission(pb_items[0], "omega"))
+        pb_proved = verify_open_lean_item(
+            pb_items[0],
+            assemble_lean_submission(pb_items[0], "omega"),
+            static_only=not has_lean,
+        )
 
         pn_items = load_lean_benchmark_items(
             "proofnet-lean4",
@@ -273,7 +309,12 @@ def run_offline_smoke_suite() -> dict[str, Any]:
                 }
             ],
         )
-        pn_proved = verify_open_lean_item(pn_items[0], "intro hx\nexact hx.mul_rat h")
+        pn_proved = verify_open_lean_item(pn_items[0], "intro hx\nexact hx.mul_rat h", static_only=True)
+
+        def _tag_lean_mode(v_dict: dict[str, Any], *, compiled: bool) -> dict[str, Any]:
+            out_d = dict(v_dict)
+            out_d["verification_mode"] = "lean_kernel" if compiled else "static_only"
+            return out_d
 
         all_ok = (
             bird_ok.passed
@@ -287,15 +328,16 @@ def run_offline_smoke_suite() -> dict[str, Any]:
         )
         return {
             "passed": all_ok,
+            "lean_toolchain_available": has_lean,
             "checks": {
                 "bird_mini_dev": bird_ok.to_dict(),
                 "spider2_lite": spider2_ok.to_dict(),
                 "ehrsql_answerable": ehr_ans_ok.to_dict(),
                 "ehrsql_abstention": ehr_abs_ok.to_dict(),
-                "lean_workbook_proved": lw_proved.to_dict(),
-                "lean_workbook_sorry_rejected": lw_sorry.to_dict(),
-                "putnambench_proved": pb_proved.to_dict(),
-                "proofnet_lean4_proved": pn_proved.to_dict(),
+                "lean_workbook_proved": _tag_lean_mode(lw_proved.to_dict(), compiled=False),
+                "lean_workbook_sorry_rejected": _tag_lean_mode(lw_sorry.to_dict(), compiled=False),
+                "putnambench_proved": _tag_lean_mode(pb_proved.to_dict(), compiled=has_lean),
+                "proofnet_lean4_proved": _tag_lean_mode(pn_proved.to_dict(), compiled=False),
             },
         }
 
@@ -362,7 +404,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             status = "PASS" if report["passed"] else "FAIL"
             print(f"Offline 2024-2026 SQL & Lean 4 benchmark smoke suite: {status}")
             for name, verdict in report["checks"].items():
-                print(f"  {name:<30} passed={verdict['passed']} reason={verdict['reason']}")
+                mode_suffix = (
+                    f" ({verdict['verification_mode'].replace('_', ' ')})"
+                    if "verification_mode" in verdict
+                    else ""
+                )
+                print(f"  {name:<30} passed={verdict['passed']} reason={verdict['reason']}{mode_suffix}")
         return 0 if report["passed"] else 1
 
     if args.dataset:

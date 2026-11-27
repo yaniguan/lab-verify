@@ -169,10 +169,21 @@ def test_mutant_sql_synthesizer_readonly_lock_and_counterexample_detection() -> 
     seed_conn.close()
 
 
-def test_idea_13_benchmark_24_sql_candidates() -> None:
+def test_idea_13_benchmark_32_sql_candidates_and_non_identical_rewrites() -> None:
+    from community_extensions.mutant_sql_synthesizer import build_sql_benchmark_candidates
+    from lab_verify.sql_gate import DDL_STATEMENTS, EXPERIMENTS, INSTRUMENTS, SAMPLES
+
+    # Every "correct" benchmark candidate must be a genuine non-identical rewrite (zero copied gold strings)
+    candidates = build_sql_benchmark_candidates()
+    rewrites = [c for c in candidates if c.is_semantically_equivalent]
+    assert len(rewrites) == 14
+    for cand in rewrites:
+        assert cand.candidate_sql.strip() != cand.gold_sql.strip()
+
     report = run_mutant_sql_benchmark()
-    assert report["num_candidates"] == 24
-    assert report["gold_candidates"] == 6
+    assert report["num_candidates"] == 32
+    assert report["gold_candidates"] == 14
+    assert report["copied_gold_candidates"] == 0
     assert report["buggy_candidates"] == 18
     assert report["num_mutants_per_schema"] == 5
 
@@ -184,9 +195,36 @@ def test_idea_13_benchmark_24_sql_candidates() -> None:
 
     assert mut_m["semantic_bugs_caught"] == 18
     assert mut_m["semantic_bug_catch_rate"] == 1.0
-    assert mut_m["gold_accepted"] == 6
+    assert mut_m["gold_accepted"] == 14
     assert mut_m["gold_acceptance_rate"] == 1.0
+    assert mut_m["false_rejects"] == 0
+    assert mut_m["false_reject_rate"] == 0.0
     assert all(count >= 2 for count in mut_m["catches_by_mutant"].values())
+
+    # Mutant 2 injects NULL rows per distinct categorical value so demo q4 (`protocol = 'ELISA'`) is caught!
+    lab_seed = sqlite3.connect(":memory:")
+    lab_seed.execute("PRAGMA foreign_keys = ON")
+    for ddl in DDL_STATEMENTS:
+        lab_seed.execute(ddl)
+    lab_seed.executemany("INSERT INTO instruments VALUES (?, ?, ?)", INSTRUMENTS)
+    lab_seed.executemany("INSERT INTO experiments VALUES (?, ?, ?, ?, ?, ?, ?, ?)", EXPERIMENTS)
+    lab_seed.executemany("INSERT INTO samples VALUES (?, ?, ?, ?, ?)", SAMPLES)
+    lab_seed.commit()
+    mutants = synthesize_five_sqlite_mutants(lab_seed, lock_readonly=True)
+    try:
+        v_q4_null = evaluate_sql_against_mutants(
+            candidate_sql="SELECT SUM(yield_pct) * 1.0 / COUNT(*) FROM experiments WHERE protocol = 'ELISA'",
+            gold_sql="SELECT AVG(yield_pct) FROM experiments WHERE protocol = 'ELISA'",
+            seed_conn=lab_seed,
+            mutants=mutants,
+        )
+        assert v_q4_null.passed_seed_db is True
+        assert v_q4_null.passed_all_mutants is False
+        assert "mutant_2_null_measurement_cells" in v_q4_null.failing_mutants
+    finally:
+        for m in mutants.values():
+            m.close()
+        lab_seed.close()
 
 
 def test_issue_29_inner_cte_order_by_and_int_float_sum_total_parity() -> None:

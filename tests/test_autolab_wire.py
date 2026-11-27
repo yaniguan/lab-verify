@@ -287,9 +287,11 @@ def test_issue_28_unsafe_python_import_and_failed_rehearsal_blocked() -> None:
 
 def test_issue_28_overnight_frontier_deferral_and_daytime_cosign_release(tmp_path: Path) -> None:
     shared_secret = "overnight-wire-stepbot-secret"
+    supervisor_secret = "overnight-wire-supervisor-secret"
     state_path = tmp_path / "wire_mcp_state.json"
     gate = LeanMcpGate(
         secret_key=shared_secret,
+        supervisor_secret_key=supervisor_secret,
         initial_deck_epoch=1,
         check_lean_kernel=False,
         state_path=state_path,
@@ -375,6 +377,7 @@ def test_issue_28_overnight_frontier_deferral_and_daytime_cosign_release(tmp_pat
     direct_released = cosign_deferred_packet(
         deferred_pkt,
         supervisor_id="dr_elena_rostova",
+        supervisor_secret_key=supervisor_secret,
         current_deck_epoch=3,
         new_nonce="daytime-direct-release-02",
     )
@@ -384,6 +387,7 @@ def test_issue_28_overnight_frontier_deferral_and_daytime_cosign_release(tmp_pat
         verify_mcp_envelope(
             direct_released["verification"]["mcp_envelope"],
             secret_key=shared_secret,
+            supervisor_secret_key=supervisor_secret,
             current_deck_epoch=3,
             actual_protocol=compiled_script,
             check_lean_kernel=False,
@@ -406,6 +410,113 @@ def test_issue_28_overnight_frontier_deferral_and_daytime_cosign_release(tmp_pat
         )
         assert receipt["ok"] is True
         assert executor.current_deck_epoch == 4
+
+
+def test_issue_34_wire_blocks_empty_packet_self_declared_cosign_dev_key_and_supports_db_path(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    # 1. Empty packet carries no protocol -> blocked (never mints lean_proof_valid: true)
+    empty_out = process_packet({})
+    assert empty_out["halted"] is True
+    assert empty_out["halt_reason"] == "L4_VERIFY_PROTOCOL_BLOCK"
+    assert empty_out["verification"]["mcp_envelope"] is None
+    assert empty_out["verification"]["static_check_passed"] is False
+
+    # 2. Missing explicit secret_key or public dev key is blocked unless allow_insecure_dev_key=True
+    dev_key_out = process_packet(
+        {
+            "compiled_python_code": SAMPLE_COMPILED_STEPBOT_PY,
+            "mcp_secret_key": autolab_wire.DEFAULT_MCP_SECRET,
+        }
+    )
+    assert dev_key_out["halted"] is True
+    assert dev_key_out["halt_reason"] == "L4_VERIFY_PROTOCOL_BLOCK"
+    assert dev_key_out["verification"]["mcp_envelope"] is None
+
+    # 3. Packet-level self-declared human_supervisor_signed without verifiable supervisor signature is blocked
+    self_cosigned = process_packet(
+        {
+            "compiled_python_code": SAMPLE_COMPILED_STEPBOT_PY,
+            "mcp_secret_key": "explicit-wire-minter-key",
+            "is_frontier_exception": True,
+            "human_supervisor_signed": True,
+            "human_supervisor_id": "self_declared_agent",
+        }
+    )
+    assert self_cosigned["halted"] is True
+    assert self_cosigned["halt_reason"] == "L4_VERIFY_PROTOCOL_BLOCK"
+    assert self_cosigned["verification"]["mcp_envelope"] is None
+
+    # Same secret for minter and supervisor is also rejected (role separation)
+    same_secret_cosigned = process_packet(
+        {
+            "compiled_python_code": SAMPLE_COMPILED_STEPBOT_PY,
+            "mcp_secret_key": "same-secret-key",
+            "mcp_supervisor_secret_key": "same-secret-key",
+            "is_frontier_exception": True,
+            "human_supervisor_signed": True,
+            "human_supervisor_id": "self_declared_agent",
+        }
+    )
+    assert same_secret_cosigned["halted"] is True
+    assert same_secret_cosigned["halt_reason"] == "L4_VERIFY_PROTOCOL_BLOCK"
+
+    # Distinct cryptographic supervisor secret passes and verifies only with both keys
+    valid_cosigned = process_packet(
+        {
+            "compiled_python_code": SAMPLE_COMPILED_STEPBOT_PY,
+            "mcp_secret_key": "explicit-wire-minter-key",
+            "mcp_supervisor_secret_key": "distinct-wire-supervisor-key",
+            "is_frontier_exception": True,
+            "human_supervisor_signed": True,
+            "human_supervisor_id": "dr_rostova",
+            "deck_epoch": 5,
+        }
+    )
+    assert valid_cosigned["halted"] is False
+    assert (
+        verify_mcp_envelope(
+            valid_cosigned["verification"]["mcp_envelope"],
+            secret_key="explicit-wire-minter-key",
+            supervisor_secret_key="distinct-wire-supervisor-key",
+            current_deck_epoch=5,
+            actual_protocol=SAMPLE_COMPILED_STEPBOT_PY,
+        ).passed
+        is True
+    )
+    assert (
+        verify_mcp_envelope(
+            valid_cosigned["verification"]["mcp_envelope"],
+            secret_key="explicit-wire-minter-key",
+            current_deck_epoch=5,
+            actual_protocol=SAMPLE_COMPILED_STEPBOT_PY,
+        ).passed
+        is False
+    )
+
+    # 4. Custom SQLite db_path allows domain tables such as `plates`
+    custom_db = tmp_path / "custom_lims.sqlite"
+    con = sqlite3.connect(custom_db)
+    con.execute("CREATE TABLE plates (id INTEGER PRIMARY KEY, barcode TEXT)")
+    con.executemany("INSERT INTO plates VALUES (?, ?)", [(1, "PLT-001"), (2, "PLT-002")])
+    con.commit()
+    con.close()
+
+    custom_out = process_packet(
+        {
+            "sql_query": "SELECT COUNT(*) FROM plates",
+            "compiled_python_code": SAMPLE_COMPILED_STEPBOT_PY,
+            "mcp_secret_key": "custom-db-wire-secret",
+            "deck_epoch": 1,
+        },
+        db_path=custom_db,
+    )
+    assert custom_out["halted"] is False
+    assert custom_out["verification"]["sql_passed"] is True
+    assert custom_out["verification"]["static_check_passed"] is True
+    assert custom_out["verification"]["mcp_envelope"] is not None
 
 
 def test_pure_english_across_wire_and_docs() -> None:

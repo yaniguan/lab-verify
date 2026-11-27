@@ -1,6 +1,10 @@
 name = "lab-verify-lean"
 version = "0.1.0"
-defaultTargets = ["LabVerifyLean"]
+defaultTargets = ["LabVerifyLean", "lab-verify-lean"]
 
 [[lean_lib]]
 name = "LabVerifyLean"
+
+[[lean_exe]]
+name = "lab-verify-lean"
+root = "Main"

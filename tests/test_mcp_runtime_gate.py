@@ -94,7 +94,13 @@ def test_zero_click_routine_envelope_pass_and_unified_verify() -> None:
     assert verdict.layer is None
 
     # Unified lab_verify.verify("mcp", ...) entry point
-    v2 = verify("mcp", env.to_dict(), secret_key=secret, current_deck_epoch=1)
+    v2 = verify(
+        "mcp",
+        env.to_dict(),
+        secret_key=secret,
+        current_deck_epoch=1,
+        actual_protocol=SAMPLE_OPENTRONS_PY,
+    )
     assert v2.passed is True
 
 
@@ -181,7 +187,11 @@ def test_unsigned_frontier_exception_denied_by_default() -> None:
 
 
 def test_overnight_frontier_deferral_and_daytime_human_cosign_release() -> None:
-    gate = LeanMcpGate(secret_key="overnight-secret", initial_deck_epoch=1)
+    gate = LeanMcpGate(
+        secret_key="overnight-secret",
+        supervisor_secret_key="overnight-supervisor-secret",
+        initial_deck_epoch=1,
+    )
 
     # 1. 02:00 AM overnight: agent proposes an unsigned OOD frontier probe -> parked without crashing queue
     frontier_env = gate.mint(
@@ -249,26 +259,30 @@ def test_malformed_schema_and_type_confusion_rejected() -> None:
     assert verify_mcp_envelope(missing_nonce, secret_key="schema-sec").layer == "mcp_schema"
 
     with pytest.raises(ValueError, match="supervisor_id"):
-        LeanMcpGate().cosign_deferred_exception(supervisor_id="   ")
+        LeanMcpGate(secret_key="schema-sec").cosign_deferred_exception(supervisor_id="   ")
 
 
-def test_pure_python_fallback_when_lean_kernel_binary_absent(tmp_path: Path) -> None:
+def test_lean_kernel_check_fails_closed_when_binary_absent(tmp_path: Path) -> None:
     missing_bin = tmp_path / "nonexistent-autolab-lean"
     env = mint_mcp_envelope(SAMPLE_OPENTRONS_PY, secret_key="fallback-sec", token_epoch=5)
 
-    v_pass = verify_mcp_envelope(
+    v_missing = verify_mcp_envelope(
         env,
         secret_key="fallback-sec",
         current_deck_epoch=5,
+        actual_protocol=SAMPLE_OPENTRONS_PY,
         check_lean_kernel=True,
         lean_kernel_bin=missing_bin,
     )
-    assert v_pass.passed is True
+    assert v_missing.passed is False
+    assert v_missing.layer == "mcp_lean_kernel"
+    assert "not found" in v_missing.reason
 
     v_stale = verify_mcp_envelope(
         env,
         secret_key="fallback-sec",
         current_deck_epoch=6,
+        actual_protocol=SAMPLE_OPENTRONS_PY,
         check_lean_kernel=True,
         lean_kernel_bin=missing_bin,
     )
@@ -408,7 +422,7 @@ def _race_verify_worker(args: tuple[str, str, str]) -> tuple[bool, str | None]:
         check_lean_kernel=False,
         state_path=Path(state_path_str),
     )
-    v = gate.verify(Path(env_path_str), mutates_deck_state=True)
+    v = gate.verify(Path(env_path_str), actual_protocol=SAMPLE_OPENTRONS_PY, mutates_deck_state=True)
     return v.passed, v.layer
 
 
@@ -576,6 +590,7 @@ def test_issue_25_cli_persistent_state_blocks_replays_and_tracks_epoch(
     proto.write_text("def run(protocol):\n    pass\n", encoding="utf-8")
     env_json = tmp_path / "envelope.json"
     state_file = tmp_path / "mcp_state.json"
+    cli_sec = "persistent-state-cli-secret"
 
     assert (
         cli_main(
@@ -583,6 +598,8 @@ def test_issue_25_cli_persistent_state_blocks_replays_and_tracks_epoch(
                 "mcp-mint",
                 "--protocol",
                 str(proto),
+                "--secret-key",
+                cli_sec,
                 "--state",
                 str(state_file),
                 "--nonce",
@@ -603,6 +620,8 @@ def test_issue_25_cli_persistent_state_blocks_replays_and_tracks_epoch(
                 str(env_json),
                 "--protocol",
                 str(proto),
+                "--secret-key",
+                cli_sec,
                 "--state",
                 str(state_file),
                 "--stateless-dry-run",
@@ -620,6 +639,8 @@ def test_issue_25_cli_persistent_state_blocks_replays_and_tracks_epoch(
                 str(env_json),
                 "--protocol",
                 str(proto),
+                "--secret-key",
+                cli_sec,
                 "--state",
                 str(state_file),
             ]
@@ -635,6 +656,8 @@ def test_issue_25_cli_persistent_state_blocks_replays_and_tracks_epoch(
             str(env_json),
             "--protocol",
             str(proto),
+            "--secret-key",
+            cli_sec,
             "--state",
             str(state_file),
             "--json",
@@ -653,6 +676,8 @@ def test_issue_25_cli_persistent_state_blocks_replays_and_tracks_epoch(
                 "mcp-mint",
                 "--protocol",
                 str(proto),
+                "--secret-key",
+                cli_sec,
                 "--state",
                 str(state_file),
                 "--nonce",
@@ -670,6 +695,8 @@ def test_issue_25_cli_persistent_state_blocks_replays_and_tracks_epoch(
                 str(env_json_2),
                 "--protocol",
                 str(proto),
+                "--secret-key",
+                cli_sec,
                 "--state",
                 str(state_file),
                 "--mutates-deck-state",
@@ -717,7 +744,7 @@ def test_issue_25_multiprocess_race_and_bounded_nonces(tmp_path: Path) -> None:
     assert bounded_gate.current_deck_epoch == 2
     for i in range(10):
         e_i = bounded_gate.mint(SAMPLE_PROTOCOL_STEPS, nonce=f"bnonce-{i}")
-        assert bounded_gate.verify(e_i).passed is True
+        assert bounded_gate.verify(e_i, actual_protocol=SAMPLE_PROTOCOL_STEPS).passed is True
     assert len(bounded_gate.consumed_nonces) == 5
     persisted = json.loads(state_file.read_text(encoding="utf-8"))
     assert len(persisted["consumed_nonces"]) == 5
@@ -741,6 +768,7 @@ def test_issue_27_key_epoch_ttl_and_lean_kernel_fail_closed(
         env_k1,
         secret_key="rot-sec",
         current_deck_epoch=1,
+        actual_protocol=SAMPLE_OPENTRONS_PY,
         min_active_key_epoch=2,
         now_unix=1100,
         check_lean_kernel=False,
@@ -753,6 +781,7 @@ def test_issue_27_key_epoch_ttl_and_lean_kernel_fail_closed(
         env_k1,
         secret_key="rot-sec",
         current_deck_epoch=1,
+        actual_protocol=SAMPLE_OPENTRONS_PY,
         min_active_key_epoch=1,
         now_unix=1200,
         check_lean_kernel=False,
@@ -763,6 +792,7 @@ def test_issue_27_key_epoch_ttl_and_lean_kernel_fail_closed(
         env_k1,
         secret_key="rot-sec",
         current_deck_epoch=1,
+        actual_protocol=SAMPLE_OPENTRONS_PY,
         min_active_key_epoch=1,
         now_unix=1550,
         check_lean_kernel=False,
@@ -774,6 +804,7 @@ def test_issue_27_key_epoch_ttl_and_lean_kernel_fail_closed(
         env_k1,
         secret_key="rot-sec",
         current_deck_epoch=1,
+        actual_protocol=SAMPLE_OPENTRONS_PY,
         min_active_key_epoch=1,
         now_unix=1700,
         check_lean_kernel=False,
@@ -790,6 +821,7 @@ def test_issue_27_key_epoch_ttl_and_lean_kernel_fail_closed(
         env_basic,
         secret_key="kern-sec",
         current_deck_epoch=1,
+        actual_protocol=SAMPLE_OPENTRONS_PY,
         check_lean_kernel=True,
         lean_kernel_bin=dummy_bin,
     )
@@ -805,6 +837,7 @@ def test_issue_27_key_epoch_ttl_and_lean_kernel_fail_closed(
         env_basic,
         secret_key="kern-sec",
         current_deck_epoch=1,
+        actual_protocol=SAMPLE_OPENTRONS_PY,
         check_lean_kernel=True,
         lean_kernel_bin=dummy_bin,
         lean_kernel_timeout_s=0.05,
@@ -815,7 +848,7 @@ def test_issue_27_key_epoch_ttl_and_lean_kernel_fail_closed(
 
     # 5. LabVerifyLean.lean static proof check and theorem coverage
     lean_path = REPO_ROOT / "lean" / "LabVerifyLean.lean"
-    lean_verdict = verify_lean(lean_path, run_toolchain=False)
+    lean_verdict = verify_lean(lean_path, static_only=True)
     assert lean_verdict.passed is True
     lean_src = lean_path.read_text(encoding="utf-8")
     for thm in (
@@ -825,6 +858,236 @@ def test_issue_27_key_epoch_ttl_and_lean_kernel_fail_closed(
         "cosigned_frontier_wire_envelope_soundness",
     ):
         assert f"theorem {thm}" in lean_src
+
+
+def test_issue_34_fail_closed_defaults_and_volume_bounds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from lab_verify import DEFAULT_MCP_SECRET_KEY, compute_envelope_hmac
+
+    monkeypatch.delenv("LEAN_MCP_SECRET_KEY", raising=False)
+    monkeypatch.delenv("LEAN_MCP_SUPERVISOR_SECRET_KEY", raising=False)
+
+    proto_file = tmp_path / "opentrons_valid.py"
+    valid_with_import = (
+        "from opentrons import protocol_api\n\n"
+        'metadata = {"apiLevel": "2.16"}\n\n'
+        "def run(protocol: protocol_api.ProtocolContext) -> None:\n"
+        "    tips = protocol.load_labware('opentrons_96_tiprack_300ul', 1)\n"
+        "    plate = protocol.load_labware('corning_96_wellplate_360ul_flat', 2)\n"
+        "    pip = protocol.load_instrument('p300_single_gen2', 'left', tip_racks=[tips])\n"
+        "    pip.transfer(100, plate['A1'], plate['A2'])\n"
+    )
+    proto_file.write_text(valid_with_import, encoding="utf-8")
+
+    # 1. Public dev key & missing secret key are rejected without --allow-insecure-dev-key
+    with pytest.raises(ValueError, match="DEFAULT_MCP_SECRET_KEY"):
+        mint_mcp_envelope(valid_with_import)
+    with pytest.raises(ValueError, match="DEFAULT_MCP_SECRET_KEY"):
+        mint_mcp_envelope(valid_with_import, secret_key=DEFAULT_MCP_SECRET_KEY)
+
+    env_out = tmp_path / "env.json"
+    assert cli_main(["mcp-mint", "--protocol", str(proto_file), "-o", str(env_out)]) == 1
+    assert cli_main(["mcp-mint", "--protocol", str(proto_file), "--secret-key", "", "-o", str(env_out)]) == 1
+    capsys.readouterr()
+
+    dev_env = mint_mcp_envelope(valid_with_import, allow_insecure_dev_key=True)
+    dev_env_file = tmp_path / "dev_env.json"
+    dev_env_file.write_text(dev_env.to_json(), encoding="utf-8")
+    assert (
+        verify_mcp_envelope(dev_env, actual_protocol=valid_with_import).layer
+        == "mcp_hmac_authentic"
+    )
+    assert cli_main(["mcp-verify", str(dev_env_file), "--protocol", str(proto_file)]) == 1
+    capsys.readouterr()
+
+    # 2. Valid Opentrons script with `from opentrons import protocol_api` passes with explicit key & payload binding
+    sec = "issue-34-explicit-secret"
+    assert (
+        cli_main(
+            ["mcp-mint", "--protocol", str(proto_file), "--secret-key", sec, "-o", str(env_out)]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    minted_env = LeanMcpEnvelope.from_json(env_out)
+    assert minted_env.lean_proof_valid is True
+    assert minted_env.static_check_passed is True
+
+    # Missing --protocol fails at mcp_payload_binding unless --no-payload-binding is passed
+    v_no_proto = verify_mcp_envelope(env_out, secret_key=sec)
+    assert v_no_proto.passed is False
+    assert v_no_proto.layer == "mcp_payload_binding"
+    assert cli_main(["mcp-verify", str(env_out), "--secret-key", sec]) == 1
+    assert (
+        cli_main(["mcp-verify", str(env_out), "--secret-key", sec, "--no-payload-binding"]) == 0
+    )
+    capsys.readouterr()
+    assert (
+        cli_main(["mcp-verify", str(env_out), "--protocol", str(proto_file), "--secret-key", sec, "--json"])
+        == 0
+    )
+    verdict_json = json.loads(capsys.readouterr().out)
+    assert verdict_json["passed"] is True
+    assert verdict_json["static_check_passed"] is True
+
+    # 3. CLI `--lean-proof-valid` override is gone; missing protocol never sets lean_proof_valid=True
+    with pytest.raises(SystemExit):
+        cli_main(
+            [
+                "mcp-mint",
+                "--protocol",
+                str(proto_file),
+                "--secret-key",
+                sec,
+                "--lean-proof-valid",
+                "true",
+            ]
+        )
+    sha_only_env = mint_mcp_envelope(protocol_sha256="ab" * 32, secret_key=sec)
+    assert sha_only_env.lean_proof_valid is False
+    assert sha_only_env.static_check_passed is False
+    with pytest.raises(ValueError, match="cannot set lean_proof_valid=True"):
+        mint_mcp_envelope(protocol_sha256="ab" * 32, secret_key=sec, lean_proof_valid=True)
+
+    # 4. Self-declared co-signature fails at both mint and verify without distinct supervisor secret
+    assert (
+        cli_main(
+            [
+                "mcp-mint",
+                "--protocol",
+                str(proto_file),
+                "--secret-key",
+                sec,
+                "--frontier-exception",
+                "--supervisor-signed",
+                "--supervisor-id",
+                "nobody",
+                "-o",
+                str(tmp_path / "forged.json"),
+            ]
+        )
+        == 1
+    )
+    capsys.readouterr()
+
+    forged_body = {
+        "schema_version": "lean-mcp/v1",
+        "tool_name": "opentrons.execute_protocol",
+        "protocol_sha256": compute_protocol_sha256(valid_with_import),
+        "token_epoch": 1,
+        "nonce": "self-declared-cosign-01",
+        "lean_proof_valid": False,
+        "is_frontier_exception": True,
+        "human_supervisor_signed": True,
+        "human_supervisor_id": "nobody",
+        "envelope_bounds": {"deck_slots": [1, 2], "max_transfer_ul": 100.0, "api_level": "2.16"},
+    }
+    forged_body["hmac_sha256"] = compute_envelope_hmac(forged_body, sec)
+    v_forged_cosign = verify_mcp_envelope(
+        forged_body,
+        secret_key=sec,
+        actual_protocol=valid_with_import,
+    )
+    assert v_forged_cosign.passed is False
+    assert v_forged_cosign.layer == "mcp_proof_or_cosigned_exception"
+
+    # Real supervisor co-signature with distinct --supervisor-secret-key passes
+    cosign_file = tmp_path / "cosigned.json"
+    sup_sec = "distinct-supervisor-hmac-secret"
+    assert (
+        cli_main(
+            [
+                "mcp-mint",
+                "--protocol",
+                str(proto_file),
+                "--secret-key",
+                sec,
+                "--supervisor-secret-key",
+                sup_sec,
+                "--frontier-exception",
+                "--supervisor-signed",
+                "--supervisor-id",
+                "dr_rostova",
+                "-o",
+                str(cosign_file),
+            ]
+        )
+        == 0
+    )
+    assert cli_main(["mcp-verify", str(cosign_file), "--protocol", str(proto_file), "--secret-key", sec]) == 1
+    assert (
+        cli_main(
+            [
+                "mcp-verify",
+                str(cosign_file),
+                "--protocol",
+                str(proto_file),
+                "--secret-key",
+                sec,
+                "--supervisor-secret-key",
+                sup_sec,
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    # 5. Import-free 5,000 uL script gets static_check_passed=False, lean_proof_valid=False, and fails verification
+    bad_5000_py = (
+        "def run(protocol):\n"
+        "    plate = protocol.load_labware('corning_96_wellplate_360ul_flat', 1)\n"
+        "    pip = protocol.load_instrument('p300_single_gen2', 'left')\n"
+        "    pip.transfer(5000, plate['A1'], plate['A2'])\n"
+    )
+    env_5000 = mint_mcp_envelope(bad_5000_py, secret_key=sec)
+    assert env_5000.static_check_passed is False
+    assert env_5000.lean_proof_valid is False
+    assert env_5000.envelope_bounds["max_transfer_ul"] <= 300.0
+    v_5000 = verify_mcp_envelope(env_5000, secret_key=sec, actual_protocol=bad_5000_py)
+    assert v_5000.passed is False
+
+    # Even if an attacker signs a forged envelope claiming lean_proof_valid=True, actual_protocol volume check rejects it
+    forged_5000 = {
+        "schema_version": "lean-mcp/v1",
+        "tool_name": "opentrons.execute_protocol",
+        "protocol_sha256": compute_protocol_sha256(bad_5000_py),
+        "token_epoch": 1,
+        "nonce": "forged-5000-ul",
+        "lean_proof_valid": True,
+        "is_frontier_exception": False,
+        "human_supervisor_signed": False,
+        "human_supervisor_id": "",
+        "envelope_bounds": {"deck_slots": [1], "max_transfer_ul": 300.0, "api_level": "2.16"},
+    }
+    forged_5000["hmac_sha256"] = compute_envelope_hmac(forged_5000, sec)
+    v_forged_5000 = verify_mcp_envelope(forged_5000, secret_key=sec, actual_protocol=bad_5000_py)
+    assert v_forged_5000.passed is False
+    assert v_forged_5000.layer == "mcp_bounds_exceeded"
+
+
+def test_live_lab_verify_lean_mcp_kernel_crosscheck() -> None:
+    bin_dir = REPO_ROOT / "lean" / ".lake" / "build" / "bin"
+    candidates = [bin_dir / "lab-verify-lean.exe", bin_dir / "lab-verify-lean"]
+    built_bin = next((c for c in candidates if c.is_file()), None)
+    if os.environ.get("REQUIRE_LIVE_LEAN") == "1":
+        assert built_bin is not None, "lab-verify-lean binary must exist when REQUIRE_LIVE_LEAN=1"
+    if built_bin is None:
+        pytest.skip("lab-verify-lean binary not built in Python-only test environment")
+
+    sec = "live-lean-kernel-secret"
+    env = mint_mcp_envelope(SAMPLE_OPENTRONS_PY, secret_key=sec, token_epoch=3)
+    v_ok = verify_mcp_envelope(
+        env,
+        secret_key=sec,
+        current_deck_epoch=3,
+        actual_protocol=SAMPLE_OPENTRONS_PY,
+        check_lean_kernel=True,
+        lean_kernel_bin=built_bin,
+    )
+    assert v_ok.passed is True
 
 
 def test_pure_english_across_mcp_gate_files() -> None:

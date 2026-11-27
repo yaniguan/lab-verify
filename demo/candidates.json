@@ -17,7 +17,7 @@
    "gold": "SELECT AVG(yield_pct) FROM experiments WHERE protocol = 'ELISA'",
    "candidates": [
      {"label": "syntax error", "sql": "SELECT AVG(yield_pct FROM experiments WHERE protocol = 'ELISA'"},
-     {"label": "correct", "sql": "SELECT SUM(yield_pct) * 1.0 / COUNT(*) FROM experiments WHERE protocol = 'ELISA'"}]},
+     {"label": "NULL-unsafe average", "sql": "SELECT SUM(yield_pct) * 1.0 / COUNT(*) FROM experiments WHERE protocol = 'ELISA'"}]},
   {"qid": 5, "question": "Which experiments failed?",
    "gold": "SELECT id FROM experiments WHERE status = 'failed'",
    "candidates": [

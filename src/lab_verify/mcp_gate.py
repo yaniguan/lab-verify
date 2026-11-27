@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -17,6 +18,7 @@ import subprocess
 import time
 from typing import Any, Mapping, Sequence
 
+from .lean_gate import verify_lean
 from .protocol_gate import verify_protocol
 from .verdict import Verdict
 
@@ -48,6 +50,7 @@ LEAN_MCP_SCHEMA_VERSION = "lean-mcp/v1"
 LEAN_MCP_STATE_SCHEMA_VERSION = "lean-mcp-state/v1"
 DEFAULT_MCP_TOOL_NAME = "opentrons.execute_protocol"
 DEFAULT_MCP_SECRET_KEY = "lean-mcp-dev-secret-v1"
+MAX_ALLOWED_PIPETTE_VOLUME_UL = 1000.0
 AUTH_MODE_HMAC = "hmac-sha256"
 AUTH_MODE_ED25519 = "ed25519"
 SUPPORTED_AUTH_MODES = frozenset({AUTH_MODE_HMAC, AUTH_MODE_ED25519})
@@ -83,6 +86,7 @@ _OPTIONAL_ENVELOPE_KEYS = frozenset(
         "issued_at_unix",
         "ttl_seconds",
         "cosigned_expires_at_unix",
+        "static_check_passed",
     }
 )
 
@@ -373,7 +377,11 @@ def compute_supervisor_cosign_payload(
     envelope_bounds: Mapping[str, Any] | None,
 ) -> bytes:
     """Build canonical `SUPERVISOR_COSIGN|<nonce>|<token_epoch>|<protocol_sha256>|<bounds_sha256>` bytes."""
-    norm_bounds = _normalize_bounds(envelope_bounds)
+    norm_bounds = {
+        k: v
+        for k, v in _normalize_bounds(envelope_bounds).items()
+        if k != "supervisor_hmac_sha256"
+    }
     bounds_sha256 = hashlib.sha256(_canonical_json_bytes(norm_bounds)).hexdigest()
     return (
         f"SUPERVISOR_COSIGN|{nonce}|{token_epoch}|{protocol_sha256.lower()}|{bounds_sha256}"
@@ -492,7 +500,15 @@ def _normalize_bounds(bounds: Mapping[str, Any] | None) -> dict[str, Any]:
     if "deck_slots" in out and isinstance(out["deck_slots"], Sequence) and not isinstance(
         out["deck_slots"], (str, bytes)
     ):
-        out["deck_slots"] = [int(s) for s in out["deck_slots"]]
+        norm_slots: list[int | str] = []
+        for s in out["deck_slots"]:
+            if isinstance(s, int) and not isinstance(s, bool):
+                norm_slots.append(s)
+            elif isinstance(s, str) and s.strip().isdigit():
+                norm_slots.append(int(s.strip()))
+            elif isinstance(s, str):
+                norm_slots.append(s.strip())
+        out["deck_slots"] = norm_slots
     if "max_transfer_ul" in out and isinstance(out["max_transfer_ul"], (int, float)) and not isinstance(
         out["max_transfer_ul"], bool
     ):
@@ -502,33 +518,195 @@ def _normalize_bounds(bounds: Mapping[str, Any] | None) -> dict[str, Any]:
     return out
 
 
+_ALLOWED_OPENTRONS_IMPORTS: frozenset[str] = frozenset(
+    {
+        "opentrons",
+        "opentrons.protocol_api",
+        "opentrons.types",
+        "math",
+        "typing",
+    }
+)
+_FORBIDDEN_PYTHON_CALLS: frozenset[str] = frozenset(
+    {
+        "eval",
+        "exec",
+        "open",
+        "compile",
+        "__import__",
+        "globals",
+        "locals",
+        "vars",
+        "getattr",
+        "setattr",
+        "delattr",
+        "input",
+        "breakpoint",
+    }
+)
+
+
+def _extract_numeric_literal(node: ast.AST) -> float | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(
+        node.value, bool
+    ):
+        return float(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        inner = _extract_numeric_literal(node.operand)
+        if inner is not None:
+            return -inner if isinstance(node.op, ast.USub) else inner
+    return None
+
+
+def _pipette_max_ul_from_model(model_name: str) -> float:
+    low = model_name.lower()
+    if "p10_" in low or low.startswith("p10"):
+        return 10.0
+    if "p20_" in low or low.startswith("p20"):
+        return 20.0
+    if "p50_" in low or low.startswith("p50"):
+        return 50.0
+    if "p300_" in low or low.startswith("p300"):
+        return 300.0
+    if "p1000_" in low or low.startswith("p1000"):
+        return 1000.0
+    return MAX_ALLOWED_PIPETTE_VOLUME_UL
+
+
+def _is_safe_top_level_import(node: ast.stmt) -> bool:
+    if isinstance(node, ast.Import):
+        return all(alias.name in _ALLOWED_OPENTRONS_IMPORTS for alias in node.names)
+    if isinstance(node, ast.ImportFrom):
+        if node.level and node.level > 0:
+            return False
+        if node.module == "__future__":
+            return all(alias.name == "annotations" for alias in node.names)
+        if node.module in ("opentrons", "opentrons.protocol_api", "opentrons.types", "typing", "math"):
+            return True
+        return False
+    return False
+
+
+def _infer_stepbot_ir_bounds(
+    ir: Mapping[str, Any],
+    *,
+    effective_ceiling: float,
+) -> tuple[bool, dict[str, Any]]:
+    default_bounds = _normalize_bounds(None)
+    steps = ir.get("steps")
+    if not isinstance(steps, list) or len(steps) == 0:
+        return False, default_bounds
+    max_vol = 0.0
+    for step in steps:
+        if not isinstance(step, Mapping):
+            return False, default_bounds
+        action = step.get("action")
+        if not isinstance(action, str) or not action.strip():
+            return False, default_bounds
+        vol = step.get("volume")
+        if vol is not None:
+            if isinstance(vol, bool) or not isinstance(vol, (int, float)):
+                return False, default_bounds
+            v_f = float(vol)
+            if not math.isfinite(v_f) or v_f <= 0.0 or v_f > effective_ceiling + 1e-9:
+                return False, default_bounds
+            max_vol = max(max_vol, v_f)
+        mix_after = step.get("mix_after")
+        if isinstance(mix_after, (list, tuple)) and len(mix_after) >= 2:
+            mv = mix_after[1]
+            if isinstance(mv, bool) or not isinstance(mv, (int, float)):
+                return False, default_bounds
+            mv_f = float(mv)
+            if not math.isfinite(mv_f) or mv_f <= 0.0 or mv_f > effective_ceiling + 1e-9:
+                return False, default_bounds
+            max_vol = max(max_vol, mv_f)
+
+    slots: list[int | str] = []
+    deck = ir.get("deck")
+    if isinstance(deck, Mapping):
+        for k in deck.keys():
+            ks = str(k).strip()
+            slots.append(int(ks) if ks.isdigit() else ks)
+    sorted_slots = sorted(slots, key=lambda x: (0, x) if isinstance(x, int) else (1, str(x)))
+    meta = ir.get("metadata") if isinstance(ir.get("metadata"), Mapping) else {}
+    api_level = str(meta.get("apiLevel", "2.16"))
+    return True, {
+        "deck_slots": sorted_slots,
+        "max_transfer_ul": float(max_vol) if max_vol > 0 else min(300.0, effective_ceiling),
+        "api_level": api_level,
+    }
+
+
 def _infer_static_proof_and_bounds(
     protocol: str | bytes | Path | Mapping[str, Any] | Sequence[Any] | None,
+    *,
+    max_transfer_ul_limit: float | None = None,
 ) -> tuple[bool, dict[str, Any]]:
     default_bounds = _normalize_bounds(None)
     if protocol is None:
-        return True, default_bounds
+        return False, default_bounds
+
+    if max_transfer_ul_limit is not None and (
+        not math.isfinite(max_transfer_ul_limit)
+        or max_transfer_ul_limit <= 0.0
+        or max_transfer_ul_limit > MAX_ALLOWED_PIPETTE_VOLUME_UL + 1e-9
+    ):
+        return False, default_bounds
+
+    effective_ir_ceiling = (
+        min(MAX_ALLOWED_PIPETTE_VOLUME_UL, float(max_transfer_ul_limit))
+        if max_transfer_ul_limit is not None
+        else MAX_ALLOWED_PIPETTE_VOLUME_UL
+    )
+    effective_pip_max = (
+        min(300.0, float(max_transfer_ul_limit))
+        if max_transfer_ul_limit is not None
+        else 300.0
+    )
+
+    def _check_structured(obj: Any) -> tuple[bool, dict[str, Any]]:
+        if isinstance(obj, Mapping) and isinstance(obj.get("steps"), list) and obj["steps"]:
+            first = obj["steps"][0]
+            if isinstance(first, Mapping) and "action" in first and "op" not in first and "type" not in first:
+                return _infer_stepbot_ir_bounds(obj, effective_ceiling=effective_ir_ceiling)
+        verdict = verify_protocol(obj, pip_max=effective_pip_max)
+        return verdict.passed, {
+            "deck_slots": [],
+            "max_transfer_ul": effective_pip_max,
+            "api_level": "2.16",
+        }
 
     text: str | None = None
     if isinstance(protocol, Path):
+        if not protocol.exists() or not protocol.is_file():
+            return False, default_bounds
         if protocol.suffix.lower() == ".py":
             text = protocol.read_text(encoding="utf-8")
         else:
-            verdict = verify_protocol(protocol)
-            return verdict.passed, default_bounds
+            try:
+                decoded_file = json.loads(protocol.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return False, default_bounds
+            return _check_structured(decoded_file)
     elif isinstance(protocol, bytes):
         text = protocol.decode("utf-8")
     elif isinstance(protocol, str):
-        if "\n" not in protocol and Path(protocol).exists():
-            return _infer_static_proof_and_bounds(Path(protocol))
+        if "\n" not in protocol and Path(protocol).exists() and Path(protocol).is_file():
+            return _infer_static_proof_and_bounds(
+                Path(protocol), max_transfer_ul_limit=max_transfer_ul_limit
+            )
         stripped = protocol.strip()
+        if not stripped or _HEX64_RE.match(stripped):
+            return False, default_bounds
         if stripped.startswith(("{", "[")):
-            verdict = verify_protocol(stripped)
-            return verdict.passed, default_bounds
+            try:
+                decoded_str = json.loads(stripped)
+            except json.JSONDecodeError:
+                return False, default_bounds
+            return _check_structured(decoded_str)
         text = protocol
     else:
-        verdict = verify_protocol(protocol)
-        return verdict.passed, default_bounds
+        return _check_structured(protocol)
 
     # Compiled Opentrons Python API v2 script AST check
     try:
@@ -536,19 +714,33 @@ def _infer_static_proof_and_bounds(
     except SyntaxError:
         return False, default_bounds
 
+    for any_node in ast.walk(tree):
+        if isinstance(any_node, ast.Call):
+            if isinstance(any_node.func, ast.Name) and any_node.func.id in _FORBIDDEN_PYTHON_CALLS:
+                return False, default_bounds
+            if isinstance(any_node.func, ast.Attribute) and any_node.func.attr in _FORBIDDEN_PYTHON_CALLS:
+                return False, default_bounds
+
     api_level = "2.16"
     has_run = False
-    slots: set[int] = set()
+    slots: list[int | str] = []
+    seen_slots: set[int | str] = set()
     max_vol = 0.0
+    pipette_ceilings: list[float] = []
+    volumes_valid = True
 
     for node in tree.body:
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            return False, default_bounds
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == "metadata":
+            if not _is_safe_top_level_import(node):
+                return False, default_bounds
+            continue
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            val_node = node.value
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id == "metadata" and val_node is not None:
                     try:
-                        meta = ast.literal_eval(node.value)
+                        meta = ast.literal_eval(val_node)
                         if isinstance(meta, dict) and isinstance(meta.get("apiLevel"), str):
                             api_level = meta["apiLevel"]
                     except ValueError:
@@ -559,31 +751,72 @@ def _infer_static_proof_and_bounds(
                 if isinstance(sub, (ast.Import, ast.ImportFrom)):
                     return False, default_bounds
                 if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
-                    if sub.func.attr == "load_labware" and len(sub.args) >= 2:
+                    attr = sub.func.attr
+                    if attr == "load_labware" and len(sub.args) >= 2:
                         slot_arg = sub.args[1]
-                        if isinstance(slot_arg, ast.Constant) and isinstance(slot_arg.value, int) and not isinstance(
-                            slot_arg.value, bool
-                        ):
-                            slots.add(slot_arg.value)
-                    elif sub.func.attr in ("transfer", "distribute", "aspirate", "dispense") and sub.args:
-                        vol_arg = sub.args[0]
-                        if isinstance(vol_arg, ast.Constant) and isinstance(
-                            vol_arg.value, (int, float)
-                        ) and not isinstance(vol_arg.value, bool):
-                            max_vol = max(max_vol, float(vol_arg.value))
-                    elif sub.func.attr == "mix" and len(sub.args) >= 2:
-                        vol_arg = sub.args[1]
-                        if isinstance(vol_arg, ast.Constant) and isinstance(
-                            vol_arg.value, (int, float)
-                        ) and not isinstance(vol_arg.value, bool):
-                            max_vol = max(max_vol, float(vol_arg.value))
+                        if isinstance(slot_arg, ast.Constant) and not isinstance(slot_arg.value, bool):
+                            if isinstance(slot_arg.value, int):
+                                if slot_arg.value not in seen_slots:
+                                    seen_slots.add(slot_arg.value)
+                                    slots.append(slot_arg.value)
+                            elif isinstance(slot_arg.value, str):
+                                s_clean = slot_arg.value.strip()
+                                slot_v: int | str = int(s_clean) if s_clean.isdigit() else s_clean
+                                if slot_v not in seen_slots:
+                                    seen_slots.add(slot_v)
+                                    slots.append(slot_v)
+                    elif attr == "load_instrument" and len(sub.args) >= 1:
+                        inst_arg = sub.args[0]
+                        if isinstance(inst_arg, ast.Constant) and isinstance(inst_arg.value, str):
+                            pipette_ceilings.append(_pipette_max_ul_from_model(inst_arg.value))
+                    elif attr in ("transfer", "distribute", "aspirate", "dispense"):
+                        vol_expr: ast.AST | None = sub.args[0] if sub.args else None
+                        if vol_expr is None:
+                            for kw in sub.keywords:
+                                if kw.arg == "volume":
+                                    vol_expr = kw.value
+                                    break
+                        if vol_expr is not None:
+                            num_v = _extract_numeric_literal(vol_expr)
+                            if num_v is None or not math.isfinite(num_v) or num_v <= 0.0:
+                                volumes_valid = False
+                            else:
+                                max_vol = max(max_vol, num_v)
+                    elif attr == "mix":
+                        vol_expr = sub.args[1] if len(sub.args) >= 2 else None
+                        if vol_expr is None:
+                            for kw in sub.keywords:
+                                if kw.arg == "volume":
+                                    vol_expr = kw.value
+                                    break
+                        if vol_expr is not None:
+                            num_v = _extract_numeric_literal(vol_expr)
+                            if num_v is None or not math.isfinite(num_v) or num_v <= 0.0:
+                                volumes_valid = False
+                            else:
+                                max_vol = max(max_vol, num_v)
 
+    pipette_limit = max(pipette_ceilings) if pipette_ceilings else MAX_ALLOWED_PIPETTE_VOLUME_UL
+    effective_ceiling = (
+        min(pipette_limit, float(max_transfer_ul_limit), MAX_ALLOWED_PIPETTE_VOLUME_UL)
+        if max_transfer_ul_limit is not None
+        else min(pipette_limit, MAX_ALLOWED_PIPETTE_VOLUME_UL)
+    )
+    if max_vol > effective_ceiling + 1e-9:
+        volumes_valid = False
+
+    sorted_slots = sorted(slots, key=lambda x: (0, x) if isinstance(x, int) else (1, str(x)))
+    reported_max_vol = (
+        float(max_vol)
+        if (volumes_valid and max_vol > 0)
+        else min(300.0, effective_ceiling)
+    )
     bounds = {
-        "deck_slots": sorted(slots),
-        "max_transfer_ul": float(max_vol) if max_vol > 0 else 300.0,
+        "deck_slots": sorted_slots,
+        "max_transfer_ul": reported_max_vol,
         "api_level": api_level,
     }
-    return has_run, bounds
+    return (has_run and volumes_valid), bounds
 
 
 @dataclass(frozen=True)
@@ -611,6 +844,9 @@ class LeanMcpEnvelope:
     issued_at_unix: int | None = None
     ttl_seconds: int | None = None
     cosigned_expires_at_unix: int | None = None
+    static_check_passed: bool = False
+    _emit_static_check_field: bool = field(default=False, repr=False, compare=False)
+    _emit_top_supervisor_hmac: bool = field(default=False, repr=False, compare=False)
 
     def payload_without_hmac(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -635,7 +871,7 @@ class LeanMcpEnvelope:
             out["supervisor_key_id"] = self.supervisor_key_id
         if self.supervisor_ed25519_sig:
             out["supervisor_ed25519_sig"] = self.supervisor_ed25519_sig
-        if self.supervisor_hmac_sha256:
+        if self._emit_top_supervisor_hmac and self.supervisor_hmac_sha256:
             out["supervisor_hmac_sha256"] = self.supervisor_hmac_sha256
         if self.key_epoch is not None:
             out["key_epoch"] = self.key_epoch
@@ -645,6 +881,8 @@ class LeanMcpEnvelope:
             out["ttl_seconds"] = self.ttl_seconds
         if self.cosigned_expires_at_unix is not None:
             out["cosigned_expires_at_unix"] = self.cosigned_expires_at_unix
+        if self._emit_static_check_field:
+            out["static_check_passed"] = self.static_check_passed
         return out
 
     def to_dict(self) -> dict[str, Any]:
@@ -683,11 +921,19 @@ class LeanMcpEnvelope:
         minter_ed25519_sig = raw.get("minter_ed25519_sig", "")
         supervisor_key_id = raw.get("supervisor_key_id", "")
         supervisor_ed25519_sig = raw.get("supervisor_ed25519_sig", "")
-        supervisor_hmac_sha256 = raw.get("supervisor_hmac_sha256", "")
+        has_top_sup_hmac = "supervisor_hmac_sha256" in raw
+        embedded_sup_hmac = (
+            envelope_bounds.get("supervisor_hmac_sha256", "")
+            if isinstance(envelope_bounds, Mapping)
+            else ""
+        )
+        supervisor_hmac_sha256 = raw.get("supervisor_hmac_sha256") or embedded_sup_hmac
         key_epoch = raw.get("key_epoch")
         issued_at_unix = raw.get("issued_at_unix")
         ttl_seconds = raw.get("ttl_seconds")
         cosigned_expires_at_unix = raw.get("cosigned_expires_at_unix")
+        has_static_field = "static_check_passed" in raw
+        static_check_passed = raw.get("static_check_passed", lean_proof_valid)
 
         if schema_version != LEAN_MCP_SCHEMA_VERSION:
             raise ValueError(
@@ -703,6 +949,8 @@ class LeanMcpEnvelope:
             raise ValueError("nonce must be a non-empty string")
         if not isinstance(lean_proof_valid, bool):
             raise ValueError("lean_proof_valid must be a boolean")
+        if not isinstance(static_check_passed, bool):
+            raise ValueError("static_check_passed must be a boolean")
         if not isinstance(is_frontier_exception, bool):
             raise ValueError("is_frontier_exception must be a boolean")
         if not isinstance(human_supervisor_signed, bool):
@@ -766,6 +1014,9 @@ class LeanMcpEnvelope:
             issued_at_unix=issued_at_unix,
             ttl_seconds=ttl_seconds,
             cosigned_expires_at_unix=cosigned_expires_at_unix,
+            static_check_passed=static_check_passed,
+            _emit_static_check_field=has_static_field,
+            _emit_top_supervisor_hmac=has_top_sup_hmac,
         )
 
     @classmethod
@@ -786,11 +1037,13 @@ def mint_mcp_envelope(
     protocol: str | bytes | Path | Mapping[str, Any] | Sequence[Any] | None = None,
     *,
     protocol_sha256: str | None = None,
-    secret_key: str | bytes | None = DEFAULT_MCP_SECRET_KEY,
+    secret_key: str | bytes | None = None,
     token_epoch: int = 1,
     tool_name: str = DEFAULT_MCP_TOOL_NAME,
     nonce: str | None = None,
     lean_proof_valid: bool | None = None,
+    lean_proof_source: str | Path | None = None,
+    rehearsal_passed: bool | None = None,
     is_frontier_exception: bool = False,
     human_supervisor_signed: bool = False,
     human_supervisor_id: str = "",
@@ -807,8 +1060,8 @@ def mint_mcp_envelope(
     issued_at_unix: int | None = None,
     ttl_seconds: int | None = None,
     cosigned_expires_at_unix: int | None = None,
-    require_explicit_key: bool = False,
-    allow_insecure_dev_key: bool = True,
+    require_explicit_key: bool = True,
+    allow_insecure_dev_key: bool = False,
 ) -> LeanMcpEnvelope:
     """Mint a canonical `lean-mcp/v1` capability envelope (`hmac-sha256` default or `ed25519`)."""
     if isinstance(token_epoch, bool) or not isinstance(token_epoch, int) or token_epoch < 0:
@@ -835,10 +1088,6 @@ def mint_mcp_envelope(
     if resolved_mode not in SUPPORTED_AUTH_MODES:
         raise ValueError(f"Unsupported auth_mode {resolved_mode!r}")
 
-    strict_key_policy = (
-        require_explicit_key or os.environ.get("LEAN_MCP_REQUIRE_EXPLICIT_KEY") == "1"
-    ) and not allow_insecure_dev_key
-
     if protocol_sha256 is not None:
         if not isinstance(protocol_sha256, str) or not _HEX64_RE.match(protocol_sha256):
             raise ValueError("protocol_sha256 must be a 64-character hex string")
@@ -848,8 +1097,30 @@ def mint_mcp_envelope(
     else:
         raise ValueError("mint_mcp_envelope requires either `protocol` or `protocol_sha256`")
 
-    inferred_valid, inferred_bounds = _infer_static_proof_and_bounds(protocol)
-    resolved_proof = inferred_valid if lean_proof_valid is None else bool(lean_proof_valid)
+    explicit_max_ul: float | None = None
+    if envelope_bounds is not None and envelope_bounds.get("max_transfer_ul") is not None:
+        raw_lim = envelope_bounds["max_transfer_ul"]
+        if isinstance(raw_lim, bool) or not isinstance(raw_lim, (int, float)):
+            raise ValueError("envelope_bounds['max_transfer_ul'] must be a finite positive number")
+        explicit_max_ul = float(raw_lim)
+
+    inferred_valid, inferred_bounds = _infer_static_proof_and_bounds(
+        protocol, max_transfer_ul_limit=explicit_max_ul
+    )
+    lean_source_ok = (
+        verify_lean(lean_proof_source, static_only=False).passed
+        if lean_proof_source is not None
+        else True
+    )
+    rehearsal_ok = True if rehearsal_passed is None else bool(rehearsal_passed)
+    ground_valid = bool(inferred_valid and lean_source_ok and rehearsal_ok)
+    if lean_proof_valid is True and not ground_valid:
+        raise ValueError(
+            "cannot set lean_proof_valid=True when protocol static/volume/rehearsal/Lean verification failed"
+        )
+    resolved_proof = (
+        ground_valid if lean_proof_valid is None else (ground_valid and bool(lean_proof_valid))
+    )
     resolved_bounds = _normalize_bounds(envelope_bounds) if envelope_bounds is not None else inferred_bounds
     resolved_nonce = secrets.token_hex(16) if nonce is None else str(nonce)
     if not resolved_nonce.strip():
@@ -857,6 +1128,7 @@ def mint_mcp_envelope(
 
     resolved_sup_ed_sig = supervisor_ed25519_sig.strip().lower() if supervisor_ed25519_sig else ""
     resolved_sup_hmac = supervisor_hmac_sha256.strip().lower() if supervisor_hmac_sha256 else ""
+    effective_secret: str | bytes | None = secret_key
 
     if resolved_mode == AUTH_MODE_ED25519:
         if minter_private_key is None:
@@ -883,15 +1155,27 @@ def mint_mcp_envelope(
                 "supervisor_ed25519_sig or distinct supervisor_private_key"
             )
     else:
-        if secret_key is None:
-            raise PermissionError("secret_key is required to mint hmac-sha256 capability envelopes")
-        if strict_key_policy and _is_default_dev_secret(secret_key):
+        if effective_secret is None:
+            if allow_insecure_dev_key:
+                effective_secret = DEFAULT_MCP_SECRET_KEY
+            else:
+                raise ValueError(
+                    "refusing to mint with DEFAULT_MCP_SECRET_KEY or missing secret_key "
+                    "(configure an explicit secret_key or pass allow_insecure_dev_key=True for dev testing)"
+                )
+        elif not allow_insecure_dev_key and _is_default_dev_secret(effective_secret):
             raise ValueError(
-                "refusing to mint with DEFAULT_MCP_SECRET_KEY when require_explicit_key=True "
+                "refusing to mint with DEFAULT_MCP_SECRET_KEY "
                 "(configure an explicit secret_key or pass allow_insecure_dev_key=True for dev testing)"
             )
+        _secret_bytes(effective_secret)
+
         if supervisor_secret_key is not None:
-            if hmac.compare_digest(_secret_bytes(secret_key), _secret_bytes(supervisor_secret_key)):
+            if not allow_insecure_dev_key and _is_default_dev_secret(supervisor_secret_key):
+                raise ValueError(
+                    "refusing to co-sign with DEFAULT_MCP_SECRET_KEY as supervisor_secret_key"
+                )
+            if hmac.compare_digest(_secret_bytes(effective_secret), _secret_bytes(supervisor_secret_key)):
                 raise ValueError("secret_key and supervisor_secret_key must be distinct keys")
             if bool(human_supervisor_signed) and not resolved_sup_hmac:
                 resolved_sup_hmac = compute_supervisor_hmac(
@@ -901,6 +1185,15 @@ def mint_mcp_envelope(
                     protocol_sha256=resolved_sha,
                     envelope_bounds=resolved_bounds,
                 )
+        if bool(human_supervisor_signed) and not resolved_sup_hmac:
+            raise PermissionError(
+                "human_supervisor_signed=True in hmac-sha256 mode requires a distinct "
+                "supervisor_secret_key or supervisor_hmac_sha256"
+            )
+        if resolved_sup_hmac:
+            if not _HEX64_RE.match(resolved_sup_hmac):
+                raise ValueError("supervisor_hmac_sha256 must be a 64-character hex string")
+            resolved_bounds = {**resolved_bounds, "supervisor_hmac_sha256": resolved_sup_hmac}
 
     unsigned: dict[str, Any] = {
         "schema_version": LEAN_MCP_SCHEMA_VERSION,
@@ -922,8 +1215,6 @@ def mint_mcp_envelope(
         unsigned["supervisor_key_id"] = supervisor_key_id
     if resolved_sup_ed_sig:
         unsigned["supervisor_ed25519_sig"] = resolved_sup_ed_sig
-    if resolved_sup_hmac:
-        unsigned["supervisor_hmac_sha256"] = resolved_sup_hmac
     if key_epoch is not None:
         unsigned["key_epoch"] = key_epoch
     if issued_at_unix is not None:
@@ -938,8 +1229,8 @@ def mint_mcp_envelope(
         digest = hashlib.sha256(bytes.fromhex(minter_sig)).hexdigest()
     else:
         minter_sig = ""
-        assert secret_key is not None
-        digest = compute_envelope_hmac(unsigned, secret_key)
+        assert effective_secret is not None
+        digest = compute_envelope_hmac(unsigned, effective_secret)
 
     return LeanMcpEnvelope(
         schema_version=LEAN_MCP_SCHEMA_VERSION,
@@ -963,20 +1254,27 @@ def mint_mcp_envelope(
         issued_at_unix=issued_at_unix,
         ttl_seconds=ttl_seconds,
         cosigned_expires_at_unix=cosigned_expires_at_unix,
+        static_check_passed=inferred_valid,
     )
 
 
 def _resolve_autolab_lean_bin(explicit_bin: str | Path | None = None) -> Path | None:
-    candidates: list[Path] = []
     if explicit_bin is not None:
-        candidates.append(Path(explicit_bin))
+        cand = Path(explicit_bin)
+        return cand if cand.is_file() else None
     env_bin = os.environ.get("AUTOLAB_LEAN_BIN")
     if env_bin:
-        candidates.append(Path(env_bin))
+        cand = Path(env_bin)
+        return cand if cand.is_file() else None
     repo_root = Path(__file__).resolve().parents[2]
+    local_build = repo_root / "lean" / ".lake" / "build" / "bin"
     sibling_build = repo_root.parent / "auto-lab" / "lean" / ".lake" / "build" / "bin"
-    candidates.append(sibling_build / "autolab-lean.exe")
-    candidates.append(sibling_build / "autolab-lean")
+    candidates = [
+        local_build / "lab-verify-lean.exe",
+        local_build / "lab-verify-lean",
+        sibling_build / "autolab-lean.exe",
+        sibling_build / "autolab-lean",
+    ]
     for cand in candidates:
         if cand.is_file():
             return cand
@@ -987,14 +1285,21 @@ def _crosscheck_autolab_lean_mcp(
     env: LeanMcpEnvelope,
     current_deck_epoch: int,
     *,
+    supervisor_verified: bool | None = None,
     lean_kernel_bin: str | Path | None = None,
     timeout_s: float = 5.0,
 ) -> tuple[bool, str | None]:
-    """Cross-check MCP invariants against compiled `autolab-lean --batch-tsv` when present."""
+    """Cross-check MCP invariants against compiled `lab-verify-lean --batch-tsv` (fail-closed if missing)."""
     bin_path = _resolve_autolab_lean_bin(lean_kernel_bin)
     if bin_path is None:
-        return True, None
+        return (
+            False,
+            "Lean kernel binary not found; build lean/ with 'lake build' or pass --lean-kernel-bin",
+        )
 
+    effective_sup = (
+        env.human_supervisor_signed if supervisor_verified is None else bool(supervisor_verified)
+    )
     tsv_line = "\t".join(
         [
             "MCP",
@@ -1002,7 +1307,7 @@ def _crosscheck_autolab_lean_mcp(
             str(current_deck_epoch),
             "1" if env.lean_proof_valid else "0",
             "1" if env.is_frontier_exception else "0",
-            "1" if env.human_supervisor_signed else "0",
+            "1" if effective_sup else "0",
         ]
     )
     try:
@@ -1028,13 +1333,14 @@ def _crosscheck_autolab_lean_mcp(
 def verify_mcp_envelope(
     envelope: LeanMcpEnvelope | Mapping[str, Any] | str | Path,
     *,
-    secret_key: str | bytes | None = DEFAULT_MCP_SECRET_KEY,
+    secret_key: str | bytes | None = None,
     current_deck_epoch: int = 1,
     actual_protocol: str | bytes | Path | Mapping[str, Any] | Sequence[Any] | None = None,
     actual_protocol_sha256: str | None = None,
+    require_payload_binding: bool = True,
     consumed_nonces: set[str] | None = None,
     record_nonce: bool = True,
-    check_lean_kernel: bool = True,
+    check_lean_kernel: bool = False,
     lean_kernel_bin: str | Path | None = None,
     lean_kernel_timeout_s: float = 5.0,
     minter_public_key: Any | None = None,
@@ -1042,8 +1348,8 @@ def verify_mcp_envelope(
     supervisor_secret_key: str | bytes | None = None,
     min_active_key_epoch: int | None = None,
     now_unix: int | float | None = None,
-    require_explicit_key: bool = False,
-    allow_insecure_dev_key: bool = True,
+    require_explicit_key: bool = True,
+    allow_insecure_dev_key: bool = False,
 ) -> Verdict:
     """Verify a `lean-mcp/v1` capability envelope under all zero-trust cryptographic and epoch invariants."""
     raw_mapping: Mapping[str, Any] | None = None
@@ -1086,11 +1392,8 @@ def verify_mcp_envelope(
             diagnostics=[str(exc)],
         )
 
-    strict_key_policy = (
-        require_explicit_key or os.environ.get("LEAN_MCP_REQUIRE_EXPLICIT_KEY") == "1"
-    ) and not allow_insecure_dev_key
-
     # 1. Cryptographic signature / HMAC authenticity
+    effective_secret: str | bytes | None = secret_key
     if parsed.auth_mode == AUTH_MODE_ED25519 or minter_public_key is not None:
         if parsed.auth_mode != AUTH_MODE_ED25519 or not parsed.minter_ed25519_sig:
             return Verdict(
@@ -1126,22 +1429,28 @@ def verify_mcp_envelope(
                 diagnostics=["mcp_signature_authentic: invalid minter_ed25519_sig"],
             )
     else:
-        if secret_key is None:
+        if effective_secret is None:
+            if allow_insecure_dev_key:
+                effective_secret = DEFAULT_MCP_SECRET_KEY
+            else:
+                return Verdict(
+                    passed=False,
+                    layer="mcp_hmac_authentic",
+                    reason=(
+                        "missing secret_key required to verify hmac-sha256 envelope "
+                        "(pass an explicit secret_key or allow_insecure_dev_key=True)"
+                    ),
+                    diagnostics=["secret_key is None and allow_insecure_dev_key=False"],
+                )
+        elif not allow_insecure_dev_key and _is_default_dev_secret(effective_secret):
             return Verdict(
                 passed=False,
                 layer="mcp_hmac_authentic",
-                reason="missing secret_key required to verify hmac-sha256 envelope",
-                diagnostics=["secret_key is None"],
-            )
-        if strict_key_policy and _is_default_dev_secret(secret_key):
-            return Verdict(
-                passed=False,
-                layer="mcp_hmac_authentic",
-                reason="insecure default development key rejected under require_explicit_key policy",
+                reason="insecure public DEFAULT_MCP_SECRET_KEY rejected (pass allow_insecure_dev_key=True only for dev testing)",
                 diagnostics=["configure an explicit secret_key or Ed25519 public key"],
             )
         try:
-            expected_hmac = compute_envelope_hmac(raw_mapping, secret_key)
+            expected_hmac = compute_envelope_hmac(raw_mapping, effective_secret)
         except (TypeError, ValueError) as exc:
             return Verdict(
                 passed=False,
@@ -1160,12 +1469,38 @@ def verify_mcp_envelope(
                 ],
             )
 
-    # 2. Protocol SHA-256 payload binding
+    # 2. Protocol SHA-256 payload binding & transfer-volume bounds check
     expected_sha: str | None = None
     if actual_protocol_sha256 is not None:
-        expected_sha = actual_protocol_sha256.strip().lower()
+        cand_sha = actual_protocol_sha256.strip().lower()
+        if not _HEX64_RE.match(cand_sha):
+            return Verdict(
+                passed=False,
+                layer="mcp_payload_binding",
+                reason="actual_protocol_sha256 must be a 64-character hex string",
+                diagnostics=[f"actual_protocol_sha256={actual_protocol_sha256!r}"],
+            )
+        expected_sha = cand_sha
     elif actual_protocol is not None:
-        expected_sha = compute_protocol_sha256(actual_protocol).lower()
+        try:
+            expected_sha = compute_protocol_sha256(actual_protocol).lower()
+        except (OSError, TypeError, ValueError) as exc:
+            return Verdict(
+                passed=False,
+                layer="mcp_payload_binding",
+                reason=f"unable to hash actual_protocol for payload binding: {exc}",
+                diagnostics=[str(exc)],
+            )
+    elif require_payload_binding:
+        return Verdict(
+            passed=False,
+            layer="mcp_payload_binding",
+            reason=(
+                "missing actual_protocol or actual_protocol_sha256 required for payload binding "
+                "(pass --protocol or --no-payload-binding)"
+            ),
+            diagnostics=["actual_protocol is None and actual_protocol_sha256 is None"],
+        )
 
     if expected_sha is not None and parsed.protocol_sha256.lower() != expected_sha:
         return Verdict(
@@ -1177,6 +1512,46 @@ def verify_mcp_envelope(
                 f"actual   protocol_sha256={expected_sha}",
             ],
         )
+
+    bound_max_raw = parsed.envelope_bounds.get("max_transfer_ul")
+    bound_max_ul: float | None = None
+    if bound_max_raw is not None:
+        if (
+            isinstance(bound_max_raw, bool)
+            or not isinstance(bound_max_raw, (int, float))
+            or not math.isfinite(float(bound_max_raw))
+            or float(bound_max_raw) <= 0.0
+        ):
+            return Verdict(
+                passed=False,
+                layer="mcp_schema",
+                reason="envelope_bounds['max_transfer_ul'] must be a finite positive number",
+                diagnostics=[f"max_transfer_ul={bound_max_raw!r}"],
+            )
+        bound_max_ul = float(bound_max_raw)
+        if not parsed.is_frontier_exception and bound_max_ul > MAX_ALLOWED_PIPETTE_VOLUME_UL + 1e-9:
+            return Verdict(
+                passed=False,
+                layer="mcp_bounds_exceeded",
+                reason=(
+                    f"envelope_bounds['max_transfer_ul']={bound_max_ul:g} exceeds routine pipette "
+                    f"ceiling {MAX_ALLOWED_PIPETTE_VOLUME_UL:g} uL"
+                ),
+                diagnostics=[f"max_transfer_ul={bound_max_ul:g}"],
+            )
+
+    if actual_protocol is not None and not parsed.is_frontier_exception:
+        static_ok, _ = _infer_static_proof_and_bounds(
+            actual_protocol,
+            max_transfer_ul_limit=bound_max_ul,
+        )
+        if not static_ok:
+            return Verdict(
+                passed=False,
+                layer="mcp_bounds_exceeded",
+                reason="dispatched protocol failed static AST safety or exceeded max_transfer_ul bounds",
+                diagnostics=[f"max_transfer_ul_limit={bound_max_ul}"],
+            )
 
     # 3. Cryptographic signing key-epoch freshness (when configured)
     if min_active_key_epoch is not None:
@@ -1272,7 +1647,7 @@ def verify_mcp_envelope(
             )
 
     # 7. Formal proof certificate OR role-separated human-supervisor co-signed frontier exception
-    supervisor_verified = parsed.human_supervisor_signed
+    supervisor_verified = False
     if parsed.is_frontier_exception and parsed.human_supervisor_signed:
         if parsed.auth_mode == AUTH_MODE_ED25519 or supervisor_public_key is not None:
             if supervisor_public_key is None or not parsed.supervisor_ed25519_sig:
@@ -1311,9 +1686,38 @@ def verify_mcp_envelope(
                 protocol_sha256=parsed.protocol_sha256,
                 envelope_bounds=parsed.envelope_bounds,
             )
-        elif supervisor_secret_key is not None:
-            if secret_key is not None and hmac.compare_digest(
-                _secret_bytes(secret_key), _secret_bytes(supervisor_secret_key)
+        else:
+            if supervisor_secret_key is None or not parsed.supervisor_hmac_sha256:
+                return Verdict(
+                    passed=False,
+                    layer="mcp_proof_or_cosigned_exception",
+                    reason=(
+                        "frontier exception requires a supervisor HMAC verified against a "
+                        "distinct supervisor_secret_key (self-declared co-signature rejected)"
+                    ),
+                    diagnostics=[
+                        "missing supervisor_secret_key or supervisor_hmac_sha256",
+                        f"human_supervisor_signed={parsed.human_supervisor_signed}",
+                    ],
+                )
+            if not allow_insecure_dev_key and _is_default_dev_secret(supervisor_secret_key):
+                return Verdict(
+                    passed=False,
+                    layer="mcp_proof_or_cosigned_exception",
+                    reason="insecure DEFAULT_MCP_SECRET_KEY rejected as supervisor_secret_key",
+                    diagnostics=["configure a distinct explicit supervisor_secret_key"],
+                )
+            try:
+                sup_sec_bytes = _secret_bytes(supervisor_secret_key)
+            except (TypeError, ValueError) as exc:
+                return Verdict(
+                    passed=False,
+                    layer="mcp_proof_or_cosigned_exception",
+                    reason=f"invalid supervisor_secret_key: {exc}",
+                    diagnostics=[str(exc)],
+                )
+            if effective_secret is not None and hmac.compare_digest(
+                _secret_bytes(effective_secret), sup_sec_bytes
             ):
                 return Verdict(
                     passed=False,
@@ -1328,9 +1732,8 @@ def verify_mcp_envelope(
                 protocol_sha256=parsed.protocol_sha256,
                 envelope_bounds=parsed.envelope_bounds,
             )
-            supervisor_verified = bool(
-                parsed.supervisor_hmac_sha256
-                and hmac.compare_digest(parsed.supervisor_hmac_sha256.lower(), expected_sup_hmac.lower())
+            supervisor_verified = hmac.compare_digest(
+                parsed.supervisor_hmac_sha256.lower(), expected_sup_hmac.lower()
             )
 
     certified_or_cosigned = (
@@ -1357,6 +1760,7 @@ def verify_mcp_envelope(
         kernel_ok, kernel_err = _crosscheck_autolab_lean_mcp(
             parsed,
             current_deck_epoch,
+            supervisor_verified=supervisor_verified,
             lean_kernel_bin=lean_kernel_bin,
             timeout_s=lean_kernel_timeout_s,
         )
@@ -1571,9 +1975,9 @@ class LeanMcpGate:
     def __init__(
         self,
         *,
-        secret_key: str | bytes | None = DEFAULT_MCP_SECRET_KEY,
+        secret_key: str | bytes | None = None,
         initial_deck_epoch: int = 1,
-        check_lean_kernel: bool = True,
+        check_lean_kernel: bool = False,
         lean_kernel_bin: str | Path | None = None,
         state_path: str | Path | None = None,
         max_consumed_nonces: int = 4096,
@@ -1586,8 +1990,8 @@ class LeanMcpGate:
         key_epoch: int | None = None,
         min_active_key_epoch: int | None = None,
         default_ttl_seconds: int | None = None,
-        require_explicit_key: bool = False,
-        allow_insecure_dev_key: bool = True,
+        require_explicit_key: bool = True,
+        allow_insecure_dev_key: bool = False,
     ) -> None:
         if isinstance(initial_deck_epoch, bool) or not isinstance(initial_deck_epoch, int) or initial_deck_epoch < 0:
             raise ValueError("initial_deck_epoch must be a non-negative integer")
@@ -1605,10 +2009,6 @@ class LeanMcpGate:
         )
         if resolved_mode not in SUPPORTED_AUTH_MODES:
             raise ValueError(f"Unsupported auth_mode {resolved_mode!r}")
-
-        strict_key_policy = (
-            require_explicit_key or os.environ.get("LEAN_MCP_REQUIRE_EXPLICIT_KEY") == "1"
-        ) and not allow_insecure_dev_key
 
         self.auth_mode = resolved_mode
         self.require_explicit_key = require_explicit_key
@@ -1636,12 +2036,14 @@ class LeanMcpGate:
                 self._minter_public_key = None
         else:
             if secret_key is None:
-                self._secret_key = None
+                self._secret_key = (
+                    _secret_bytes(DEFAULT_MCP_SECRET_KEY) if allow_insecure_dev_key else None
+                )
             else:
-                if strict_key_policy and _is_default_dev_secret(secret_key):
+                if not allow_insecure_dev_key and _is_default_dev_secret(secret_key):
                     raise ValueError(
                         "refusing to initialize LeanMcpGate with DEFAULT_MCP_SECRET_KEY "
-                        "when require_explicit_key=True"
+                        "(configure an explicit secret_key or pass allow_insecure_dev_key=True)"
                     )
                 self._secret_key = _secret_bytes(secret_key)
             self._minter_private_key = None
@@ -1659,6 +2061,10 @@ class LeanMcpGate:
         ):
             raise ValueError("minter_public_key and supervisor_public_key must be distinct Ed25519 keys")
 
+        if supervisor_secret_key is not None and not allow_insecure_dev_key and _is_default_dev_secret(supervisor_secret_key):
+            raise ValueError(
+                "refusing to initialize LeanMcpGate with DEFAULT_MCP_SECRET_KEY as supervisor_secret_key"
+            )
         self._supervisor_secret_key: bytes | None = (
             _secret_bytes(supervisor_secret_key) if supervisor_secret_key is not None else None
         )
@@ -1713,6 +2119,8 @@ class LeanMcpGate:
         tool_name: str = DEFAULT_MCP_TOOL_NAME,
         nonce: str | None = None,
         lean_proof_valid: bool | None = None,
+        lean_proof_source: str | Path | None = None,
+        rehearsal_passed: bool | None = None,
         is_frontier_exception: bool = False,
         human_supervisor_signed: bool = False,
         human_supervisor_id: str = "",
@@ -1720,6 +2128,7 @@ class LeanMcpGate:
         supervisor_private_key: Any | None = None,
         supervisor_ed25519_sig: str = "",
         supervisor_key_id: str = "",
+        supervisor_secret_key: str | bytes | None = None,
         supervisor_hmac_sha256: str = "",
         key_epoch: int | None = None,
         issued_at_unix: int | None = None,
@@ -1738,6 +2147,9 @@ class LeanMcpGate:
             if issued_at_unix is None
             else issued_at_unix
         )
+        eff_sup_secret = (
+            self._supervisor_secret_key if supervisor_secret_key is None else supervisor_secret_key
+        )
         return mint_mcp_envelope(
             protocol,
             protocol_sha256=protocol_sha256,
@@ -1746,6 +2158,8 @@ class LeanMcpGate:
             tool_name=tool_name,
             nonce=nonce,
             lean_proof_valid=lean_proof_valid,
+            lean_proof_source=lean_proof_source,
+            rehearsal_passed=rehearsal_passed,
             is_frontier_exception=is_frontier_exception,
             human_supervisor_signed=human_supervisor_signed,
             human_supervisor_id=human_supervisor_id,
@@ -1756,7 +2170,7 @@ class LeanMcpGate:
             supervisor_private_key=supervisor_private_key,
             supervisor_ed25519_sig=supervisor_ed25519_sig,
             supervisor_key_id=supervisor_key_id,
-            supervisor_secret_key=self._supervisor_secret_key,
+            supervisor_secret_key=eff_sup_secret,
             supervisor_hmac_sha256=supervisor_hmac_sha256,
             key_epoch=effective_key_epoch,
             issued_at_unix=effective_issued,
@@ -1780,6 +2194,8 @@ class LeanMcpGate:
         *,
         actual_protocol: str | bytes | Path | Mapping[str, Any] | Sequence[Any] | None = None,
         actual_protocol_sha256: str | None = None,
+        require_payload_binding: bool = True,
+        supervisor_secret_key: str | bytes | None = None,
         mutates_deck_state: bool = False,
         defer_unsigned_frontier: bool = False,
         stateless_dry_run: bool = False,
@@ -1794,6 +2210,8 @@ class LeanMcpGate:
                     envelope,
                     actual_protocol=actual_protocol,
                     actual_protocol_sha256=actual_protocol_sha256,
+                    require_payload_binding=require_payload_binding,
+                    supervisor_secret_key=supervisor_secret_key,
                     mutates_deck_state=mutates_deck_state,
                     defer_unsigned_frontier=defer_unsigned_frontier,
                     stateless_dry_run=stateless_dry_run,
@@ -1810,6 +2228,8 @@ class LeanMcpGate:
             envelope,
             actual_protocol=actual_protocol,
             actual_protocol_sha256=actual_protocol_sha256,
+            require_payload_binding=require_payload_binding,
+            supervisor_secret_key=supervisor_secret_key,
             mutates_deck_state=mutates_deck_state,
             defer_unsigned_frontier=defer_unsigned_frontier,
             stateless_dry_run=stateless_dry_run,
@@ -1823,25 +2243,31 @@ class LeanMcpGate:
         *,
         actual_protocol: str | bytes | Path | Mapping[str, Any] | Sequence[Any] | None,
         actual_protocol_sha256: str | None,
+        require_payload_binding: bool,
+        supervisor_secret_key: str | bytes | None,
         mutates_deck_state: bool,
         defer_unsigned_frontier: bool,
         stateless_dry_run: bool,
         now_unix: int | float | None,
         wire_packet: Mapping[str, Any] | None,
     ) -> Verdict:
+        eff_sup_secret = (
+            self._supervisor_secret_key if supervisor_secret_key is None else supervisor_secret_key
+        )
         verdict = verify_mcp_envelope(
             envelope,
             secret_key=self._secret_key,
             current_deck_epoch=self.current_deck_epoch,
             actual_protocol=actual_protocol,
             actual_protocol_sha256=actual_protocol_sha256,
+            require_payload_binding=require_payload_binding,
             consumed_nonces=self.consumed_nonces,
             record_nonce=False,
             check_lean_kernel=self.check_lean_kernel,
             lean_kernel_bin=self.lean_kernel_bin,
             minter_public_key=self._minter_public_key,
             supervisor_public_key=self._supervisor_public_key,
-            supervisor_secret_key=self._supervisor_secret_key,
+            supervisor_secret_key=eff_sup_secret,
             min_active_key_epoch=self.min_active_key_epoch,
             now_unix=now_unix,
             require_explicit_key=self.require_explicit_key,
@@ -1885,6 +2311,8 @@ class LeanMcpGate:
         supervisor_private_key: Any | None = None,
         supervisor_ed25519_sig: str = "",
         supervisor_key_id: str = "",
+        supervisor_secret_key: str | bytes | None = None,
+        supervisor_hmac_sha256: str = "",
         current_deck_epoch: int | None = None,
         ttl_seconds: int | None = None,
     ) -> LeanMcpEnvelope:
@@ -1902,6 +2330,8 @@ class LeanMcpGate:
                     supervisor_private_key=supervisor_private_key,
                     supervisor_ed25519_sig=supervisor_ed25519_sig,
                     supervisor_key_id=supervisor_key_id,
+                    supervisor_secret_key=supervisor_secret_key,
+                    supervisor_hmac_sha256=supervisor_hmac_sha256,
                     current_deck_epoch=current_deck_epoch,
                     ttl_seconds=ttl_seconds,
                 )
@@ -1918,6 +2348,8 @@ class LeanMcpGate:
             supervisor_private_key=supervisor_private_key,
             supervisor_ed25519_sig=supervisor_ed25519_sig,
             supervisor_key_id=supervisor_key_id,
+            supervisor_secret_key=supervisor_secret_key,
+            supervisor_hmac_sha256=supervisor_hmac_sha256,
             current_deck_epoch=current_deck_epoch,
             ttl_seconds=ttl_seconds,
         )
@@ -1931,6 +2363,8 @@ class LeanMcpGate:
         supervisor_private_key: Any | None,
         supervisor_ed25519_sig: str,
         supervisor_key_id: str,
+        supervisor_secret_key: str | bytes | None,
+        supervisor_hmac_sha256: str,
         current_deck_epoch: int | None,
         ttl_seconds: int | None,
     ) -> LeanMcpEnvelope:
@@ -1961,6 +2395,12 @@ class LeanMcpGate:
 
         effective_ttl = self.default_ttl_seconds if ttl_seconds is None else ttl_seconds
         effective_issued = int(time.time()) if effective_ttl is not None else None
+        eff_sup_secret = (
+            self._supervisor_secret_key if supervisor_secret_key is None else supervisor_secret_key
+        )
+        clean_bounds = {
+            k: v for k, v in parked.envelope_bounds.items() if k != "supervisor_hmac_sha256"
+        }
 
         minted = mint_mcp_envelope(
             protocol_sha256=parked.protocol_sha256,
@@ -1968,18 +2408,19 @@ class LeanMcpGate:
             token_epoch=target_epoch,
             tool_name=parked.tool_name,
             nonce=resolved_nonce,
-            lean_proof_valid=parked.lean_proof_valid,
+            lean_proof_valid=False,
             is_frontier_exception=True,
             human_supervisor_signed=True,
             human_supervisor_id=supervisor_id.strip(),
-            envelope_bounds=parked.envelope_bounds,
+            envelope_bounds=clean_bounds,
             auth_mode=self.auth_mode,
             minter_private_key=self._minter_private_key,
             minter_key_id=self.minter_key_id,
             supervisor_private_key=supervisor_private_key,
             supervisor_ed25519_sig=supervisor_ed25519_sig,
             supervisor_key_id=supervisor_key_id,
-            supervisor_secret_key=self._supervisor_secret_key,
+            supervisor_secret_key=eff_sup_secret,
+            supervisor_hmac_sha256=supervisor_hmac_sha256,
             key_epoch=self.key_epoch,
             issued_at_unix=effective_issued,
             ttl_seconds=effective_ttl,

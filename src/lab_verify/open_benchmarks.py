@@ -480,11 +480,49 @@ def parse_spider2_lite_items(
     return out
 
 
+_EHRSQL_MACRO_REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\bcurrent_time\b", flags=re.IGNORECASE), "'2100-12-31 23:59:00'"),
+    (re.compile(r"\bcurrent_date\b", flags=re.IGNORECASE), "'2100-12-31'"),
+    (re.compile(r"\btemperature_lower\b"), "35.5"),
+    (re.compile(r"\btemperature_upper\b"), "38.1"),
+    (re.compile(r"\bsao2_lower\b"), "95.0"),
+    (re.compile(r"\bsao2_upper\b"), "100.0"),
+    (re.compile(r"\bheart_rate_lower\b"), "60.0"),
+    (re.compile(r"\bheart_rate_upper\b"), "100.0"),
+    (re.compile(r"\brespiration_lower\b"), "12.0"),
+    (re.compile(r"\brespiration_upper\b"), "18.0"),
+    (re.compile(r"\bsystolic_bp_lower\b"), "90.0"),
+    (re.compile(r"\bsystolic_bp_upper\b"), "120.0"),
+    (re.compile(r"\bdiastolic_bp_lower\b"), "60.0"),
+    (re.compile(r"\bdiastolic_bp_upper\b"), "90.0"),
+    (re.compile(r"\bmean_bp_lower\b"), "60.0"),
+    (re.compile(r"\bmean_bp_upper\b"), "110.0"),
+)
+
+
+def postprocess_ehrsql_sql(sql: str, *, expand_current_time: bool = True) -> str:
+    """Apply official EHRSQL-2024 clinical vital-range and `2100-12-31 23:59:00` time-anchor macros."""
+    parts = re.split(r"('(?:''|[^'])*')", sql)
+    out_parts: list[str] = []
+    for idx, chunk in enumerate(parts):
+        if idx % 2 == 1:
+            out_parts.append(chunk)
+            continue
+        updated = chunk
+        for pattern, replacement in _EHRSQL_MACRO_REPLACEMENTS:
+            if not expand_current_time and replacement.startswith("'2100-"):
+                continue
+            updated = pattern.sub(replacement, updated)
+        out_parts.append(updated)
+    return "".join(out_parts)
+
+
 def parse_ehrsql_items(
     data_or_annotated: str | Path | Mapping[str, Any] | Sequence[Mapping[str, Any]],
     *,
     labels: str | Path | Mapping[str, Any] | None = None,
     db_id: str = "mimic_iv",
+    postprocess_sql: bool = True,
 ) -> list[OpenSqlBenchmarkItem]:
     """Parse `glee4810/ehrsql-2024` (`annotated.json` or paired `data.json` + `label.json`)."""
     rows = _read_records(data_or_annotated)
@@ -511,6 +549,11 @@ def parse_ehrsql_items(
         raw_sql = label_map.get(item_id) if item_id in label_map else row.get("query", row.get("SQL", row.get("label")))
         sql_str = "" if raw_sql is None else str(raw_sql).strip()
         is_unans = sql_str.lower() in ABSTENTION_TOKENS or bool(row.get("is_impossible", False))
+        resolved_gold = (
+            None
+            if is_unans
+            else (postprocess_ehrsql_sql(sql_str) if postprocess_sql else sql_str)
+        )
         item_db = str(row.get("db_id") or db_id).strip()
         out.append(
             OpenSqlBenchmarkItem(
@@ -518,7 +561,7 @@ def parse_ehrsql_items(
                 item_id=item_id,
                 db_id=item_db,
                 question=question,
-                gold_sql=None if is_unans else sql_str,
+                gold_sql=resolved_gold,
                 evidence=str(row.get("template") or "").strip(),
                 is_unanswerable=is_unans,
                 dialect="sqlite",
@@ -637,6 +680,11 @@ def verify_open_sql_item(
     schema: Mapping[str, Sequence[str]] | None = None,
     strict_joins: bool = True,
     allow_cross_join: bool = False,
+    allow_recursive_cte: bool = True,
+    max_vm_steps: int = 100_000,
+    timeout_s: float = 1.0,
+    max_rows: int = 10_000,
+    max_value_bytes: int = 1_048_576,
 ) -> VerifyVerdict:
     """Verify a candidate response on an `OpenSqlBenchmarkItem` through the 4-layer read-only `sql_gate`."""
     abstained = _is_abstention(candidate_sql)
@@ -702,6 +750,11 @@ def verify_open_sql_item(
             schema=effective_schema,
             strict_joins=strict_joins,
             allow_cross_join=allow_cross_join,
+            allow_recursive_cte=allow_recursive_cte,
+            max_vm_steps=max_vm_steps,
+            timeout_s=timeout_s,
+            max_rows=max_rows,
+            max_value_bytes=max_value_bytes,
         )
     finally:
         if owns_con:
@@ -715,44 +768,84 @@ def evaluate_open_sql_batch(
     *,
     strict_joins: bool = True,
     allow_cross_join: bool = False,
+    allow_recursive_cte: bool = True,
+    max_vm_steps: int = 100_000,
+    timeout_s: float = 1.0,
+    max_rows: int = 10_000,
+    max_value_bytes: int = 1_048_576,
 ) -> dict[str, Any]:
     """Batch-verify candidate outputs across open SQL benchmark items and summarize per-layer rejections."""
     layer_counts: dict[str, int] = {name: 0 for name in LAYERS}
     passed = 0
     results: list[dict[str, Any]] = []
 
-    for item in items:
-        cand = candidates_by_item_id.get(item.item_id)
-        if isinstance(db_or_map, Mapping):
-            if item.db_id not in db_or_map and not item.is_unanswerable:
-                raise KeyError(f"missing SQLite database connection/path for db_id={item.db_id!r}")
-            target_db: Any = db_or_map.get(item.db_id, ":memory:")
-        else:
-            target_db = db_or_map
+    opened_cons: dict[str, tuple[sqlite3.Connection, dict[str, list[str]]]] = {}
+    single_con_info: tuple[sqlite3.Connection, dict[str, list[str]], bool] | None = None
+    if isinstance(db_or_map, (str, Path)):
+        db_str = str(db_or_map)
+        if db_str != ":memory:" and any(not i.is_unanswerable for i in items):
+            c, sch = open_readonly_db(db_or_map)
+            single_con_info = (c, sch, True)
+    elif isinstance(db_or_map, sqlite3.Connection):
+        sch = introspect_sqlite_schema(db_or_map)
+        lock_connection_readonly(db_or_map)
+        single_con_info = (db_or_map, sch, False)
 
-        verdict = verify_open_sql_item(
-            target_db,
-            item,
-            cand,
-            strict_joins=strict_joins,
-            allow_cross_join=allow_cross_join,
-        )
-        if verdict.passed:
-            passed += 1
-        elif verdict.layer in layer_counts:
-            layer_counts[verdict.layer] += 1
+    try:
+        for item in items:
+            cand = candidates_by_item_id.get(item.item_id)
+            target_schema: Mapping[str, Sequence[str]] | None = None
+            if isinstance(db_or_map, Mapping):
+                if item.db_id not in db_or_map and not item.is_unanswerable:
+                    raise KeyError(f"missing SQLite database connection/path for db_id={item.db_id!r}")
+                raw_target = db_or_map.get(item.db_id, ":memory:")
+                if not item.is_unanswerable and isinstance(raw_target, (str, Path)) and str(raw_target) != ":memory:":
+                    if item.db_id not in opened_cons:
+                        opened_cons[item.db_id] = open_readonly_db(raw_target)
+                    target_db: Any = opened_cons[item.db_id][0]
+                    target_schema = opened_cons[item.db_id][1]
+                else:
+                    target_db = raw_target
+            elif single_con_info is not None:
+                target_db = single_con_info[0]
+                target_schema = single_con_info[1]
+            else:
+                target_db = db_or_map
 
-        results.append(
-            {
-                "dataset_id": item.dataset_id,
-                "item_id": item.item_id,
-                "db_id": item.db_id,
-                "is_unanswerable": item.is_unanswerable,
-                "passed": verdict.passed,
-                "layer": verdict.layer,
-                "reason": verdict.reason,
-            }
-        )
+            verdict = verify_open_sql_item(
+                target_db,
+                item,
+                cand,
+                schema=target_schema,
+                strict_joins=strict_joins,
+                allow_cross_join=allow_cross_join,
+                allow_recursive_cte=allow_recursive_cte,
+                max_vm_steps=max_vm_steps,
+                timeout_s=timeout_s,
+                max_rows=max_rows,
+                max_value_bytes=max_value_bytes,
+            )
+            if verdict.passed:
+                passed += 1
+            elif verdict.layer in layer_counts:
+                layer_counts[verdict.layer] += 1
+
+            results.append(
+                {
+                    "dataset_id": item.dataset_id,
+                    "item_id": item.item_id,
+                    "db_id": item.db_id,
+                    "is_unanswerable": item.is_unanswerable,
+                    "passed": verdict.passed,
+                    "layer": verdict.layer,
+                    "reason": verdict.reason,
+                }
+            )
+    finally:
+        if single_con_info is not None and single_con_info[2]:
+            single_con_info[0].close()
+        for c, _ in opened_cons.values():
+            c.close()
 
     total = len(items)
     return {
@@ -1074,11 +1167,13 @@ def verify_open_lean_item(
     item: OpenLeanBenchmarkItem,
     candidate_proof_or_source: str | None = None,
     *,
-    run_toolchain: bool = False,
+    run_toolchain: bool | None = None,
+    static_only: bool = False,
     project_dir: str | Path | None = None,
-    timeout_s: float = 30.0,
+    run_leanchecker: bool = False,
+    timeout_s: float = 60.0,
 ) -> VerifyVerdict:
-    """Verify a candidate Lean 4 proof against an `OpenLeanBenchmarkItem` via `lean_gate` (zero `sorry`/`axiom`)."""
+    """Verify a candidate Lean 4 proof against an `OpenLeanBenchmarkItem` via `lean_gate` (live compile + `#print axioms`)."""
     raw_cand = item.reference_proof if candidate_proof_or_source is None else candidate_proof_or_source
     if raw_cand is None or not str(raw_cand).strip():
         # Fall back to auditing the raw benchmark statement itself (which typically fails on `sorry`)
@@ -1117,10 +1212,17 @@ def verify_open_lean_item(
             ],
         )
 
+    stmt_no_comments = strip_lean_comments(item.formal_statement)
+    thm_m = _THEOREM_DECL_RE.search(stmt_no_comments)
+    expected_decls = [thm_m.group(1)] if thm_m is not None else None
+
     return verify_lean(
         full_source,
         run_toolchain=run_toolchain,
+        static_only=static_only,
         project_dir=project_dir,
+        run_leanchecker=run_leanchecker,
+        expected_decls=expected_decls,
         timeout_s=timeout_s,
     )
 
@@ -1129,10 +1231,13 @@ def evaluate_open_lean_batch(
     items: Sequence[OpenLeanBenchmarkItem],
     candidates_by_item_id: Mapping[str, str | None] | None = None,
     *,
-    run_toolchain: bool = False,
+    run_toolchain: bool | None = None,
+    static_only: bool = False,
     project_dir: str | Path | None = None,
+    run_leanchecker: bool = False,
+    timeout_s: float = 60.0,
 ) -> dict[str, Any]:
-    """Batch-audit Lean 4 benchmark proofs enforcing signature integrity and zero `sorry`/`axiom`."""
+    """Batch-audit Lean 4 benchmark proofs enforcing signature integrity, live kernel compilation, and `#print axioms`."""
     passed = 0
     layer_counts: dict[str, int] = {"parse": 0, "schema": 0, "soundness": 0, "execution": 0}
     results: list[dict[str, Any]] = []
@@ -1143,7 +1248,10 @@ def evaluate_open_lean_batch(
             item,
             cand,
             run_toolchain=run_toolchain,
+            static_only=static_only,
             project_dir=project_dir,
+            run_leanchecker=run_leanchecker,
+            timeout_s=timeout_s,
         )
         if verdict.passed:
             passed += 1

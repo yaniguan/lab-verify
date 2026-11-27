@@ -15,8 +15,8 @@ from .lean_gate import verify_lean
 from .mcp_gate import (
     AUTH_MODE_ED25519,
     AUTH_MODE_HMAC,
-    DEFAULT_MCP_SECRET_KEY,
     DEFAULT_MCP_TOOL_NAME,
+    LeanMcpEnvelope,
     LeanMcpGate,
     mint_mcp_envelope,
     verify_mcp_envelope,
@@ -43,6 +43,10 @@ def evaluate_benchmark_file(
     db_path: Path | None = None,
     as_json: bool = False,
     allow_cross_join: bool = False,
+    max_vm_steps: int = 5_000_000,
+    timeout_s: float = 2.0,
+    max_rows: int = 10_000,
+    max_value_bytes: int = 1_000_000,
 ) -> int:
     items = json.loads(candidates_path.read_text(encoding="utf-8"))
     schema_errors = validate_candidates_schema(items)
@@ -68,6 +72,10 @@ def evaluate_benchmark_file(
         schema=db_schema,
         strict_joins=True,
         allow_cross_join=allow_cross_join,
+        max_vm_steps=max_vm_steps,
+        timeout_s=timeout_s,
+        max_rows=max_rows,
+        max_value_bytes=max_value_bytes,
     )
 
     if not as_json and db_path is None:
@@ -158,6 +166,14 @@ def _resolve_state_path(explicit: Path | None) -> Path | None:
     return None
 
 
+def _resolve_secret(explicit: str | None, env_var: str) -> str | None:
+    """Resolve an explicit secret from CLI or environment, treating empty strings as unset."""
+    if explicit is not None:
+        return explicit if explicit.strip() else None
+    env_val = os.environ.get(env_var, "")
+    return env_val if env_val.strip() else None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lab-verify",
@@ -175,7 +191,47 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Benchmark candidates JSON file (defaults to demo/candidates.json).",
     )
-    parser.add_argument("--lean", type=Path, default=None, help="Lean 4 source file to audit.")
+    parser.add_argument(
+        "--max-vm-steps",
+        type=int,
+        default=5_000_000,
+        help="Maximum SQLite VM opcodes before aborting execution (default: 5000000).",
+    )
+    parser.add_argument(
+        "--timeout-s",
+        type=float,
+        default=2.0,
+        help="Wall-clock SQL execution timeout in seconds (default: 2.0).",
+    )
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=10_000,
+        help="Maximum result rows fetched per SQL query (default: 10000).",
+    )
+    parser.add_argument(
+        "--max-value-bytes",
+        type=int,
+        default=1_000_000,
+        help="Maximum byte size of a single SQL cell value (default: 1000000).",
+    )
+    parser.add_argument("--lean", type=Path, default=None, help="Lean 4 source file to compile and audit.")
+    parser.add_argument(
+        "--lean-project",
+        type=Path,
+        default=None,
+        help="Optional Lake project directory for compiling --lean imports.",
+    )
+    parser.add_argument(
+        "--lean-static-only",
+        action="store_true",
+        help="Run heuristic static Lean scan without invoking the Lean 4 compiler.",
+    )
+    parser.add_argument(
+        "--leanchecker",
+        action="store_true",
+        help="Replay compiled .olean output through leanchecker when --lean succeeds.",
+    )
     parser.add_argument("--protocol", type=Path, default=None, help="Benchtop protocol JSON file to verify.")
     parser.add_argument(
         "--mcp-mint",
@@ -202,10 +258,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Shared HMAC secret key for Lean-MCP envelopes (or set LEAN_MCP_SECRET_KEY).",
     )
     parser.add_argument(
+        "--mcp-supervisor-secret-key",
+        type=str,
+        default=None,
+        help="Distinct HMAC secret key for human supervisor co-signatures (or LEAN_MCP_SUPERVISOR_SECRET_KEY).",
+    )
+    parser.add_argument(
         "--mcp-protocol",
         type=Path,
         default=None,
         help="Actual protocol script/IR file to bind against during --mcp-verify.",
+    )
+    parser.add_argument(
+        "--no-payload-binding",
+        action="store_true",
+        help="Explicitly skip payload binding check during MCP verification (dry-run only).",
+    )
+    parser.add_argument(
+        "--allow-insecure-dev-key",
+        action="store_true",
+        help="Explicitly opt into DEFAULT_MCP_SECRET_KEY for local development/testing only.",
+    )
+    parser.add_argument(
+        "--check-lean-kernel",
+        action="store_true",
+        help="Cross-check MCP invariants against compiled lab-verify-lean binary (fails closed if missing).",
+    )
+    parser.add_argument(
+        "--lean-kernel-bin",
+        type=Path,
+        default=None,
+        help="Explicit path to compiled lab-verify-lean / autolab-lean binary.",
     )
     parser.add_argument(
         "--mcp-output",
@@ -269,6 +352,12 @@ def _run_mcp_mint_subcommand(sub_argv: Sequence[str]) -> int:
         help="Explicit 64-hex SHA-256 of canonical protocol IR or compiled script.",
     )
     parser.add_argument(
+        "--lean-proof",
+        type=Path,
+        default=None,
+        help="Optional Lean 4 proof source file that must compile cleanly to certify lean_proof_valid.",
+    )
+    parser.add_argument(
         "--epoch",
         type=int,
         default=None,
@@ -286,7 +375,19 @@ def _run_mcp_mint_subcommand(sub_argv: Sequence[str]) -> int:
         "--secret-key",
         type=str,
         default=None,
-        help="Shared HMAC secret key (defaults to LEAN_MCP_SECRET_KEY or dev key).",
+        help="Shared HMAC secret key (or LEAN_MCP_SECRET_KEY; required unless --allow-insecure-dev-key).",
+    )
+    parser.add_argument(
+        "--supervisor-secret-key",
+        type=str,
+        default=None,
+        help="Distinct HMAC secret key for human supervisor co-signature (or LEAN_MCP_SUPERVISOR_SECRET_KEY).",
+    )
+    parser.add_argument(
+        "--supervisor-hmac",
+        type=str,
+        default="",
+        help="Detached 64-hex human supervisor HMAC-SHA256.",
     )
     parser.add_argument(
         "--auth-mode",
@@ -319,7 +420,7 @@ def _run_mcp_mint_subcommand(sub_argv: Sequence[str]) -> int:
     parser.add_argument(
         "--require-explicit-key",
         action="store_true",
-        help="Reject fallback to DEFAULT_MCP_SECRET_KEY unless --allow-insecure-dev-key is set.",
+        help="Require explicit non-dev key (enabled by default unless --allow-insecure-dev-key is set).",
     )
     parser.add_argument(
         "--allow-insecure-dev-key",
@@ -334,12 +435,6 @@ def _run_mcp_mint_subcommand(sub_argv: Sequence[str]) -> int:
     )
     parser.add_argument("--nonce", type=str, default=None, help="Explicit single-use nonce.")
     parser.add_argument(
-        "--lean-proof-valid",
-        choices=("true", "false"),
-        default=None,
-        help="Explicitly override lean_proof_valid boolean.",
-    )
-    parser.add_argument(
         "--frontier-exception",
         action="store_true",
         help="Mark call as an out-of-regime frontier exception.",
@@ -347,7 +442,7 @@ def _run_mcp_mint_subcommand(sub_argv: Sequence[str]) -> int:
     parser.add_argument(
         "--supervisor-signed",
         action="store_true",
-        help="Include human supervisor co-signature flag.",
+        help="Include cryptographic human supervisor co-signature.",
     )
     parser.add_argument(
         "--supervisor-id",
@@ -358,20 +453,21 @@ def _run_mcp_mint_subcommand(sub_argv: Sequence[str]) -> int:
     parser.add_argument("-o", "--output", type=Path, default=None, help="Output JSON file path.")
     ns = parser.parse_args(sub_argv)
 
-    explicit_secret = ns.secret_key or os.environ.get("LEAN_MCP_SECRET_KEY")
-    secret = explicit_secret if explicit_secret is not None else DEFAULT_MCP_SECRET_KEY
-    minter_priv = ns.minter_private_key or os.environ.get("LEAN_MCP_MINTER_PRIVATE_KEY")
-    sup_priv = ns.supervisor_private_key or os.environ.get("LEAN_MCP_SUPERVISOR_PRIVATE_KEY")
+    secret = _resolve_secret(ns.secret_key, "LEAN_MCP_SECRET_KEY")
+    sup_secret = _resolve_secret(ns.supervisor_secret_key, "LEAN_MCP_SUPERVISOR_SECRET_KEY")
+    minter_priv = _resolve_secret(ns.minter_private_key, "LEAN_MCP_MINTER_PRIVATE_KEY")
+    sup_priv = _resolve_secret(ns.supervisor_private_key, "LEAN_MCP_SUPERVISOR_PRIVATE_KEY")
     proto_arg: Path | str | None = ns.protocol if ns.protocol is not None else ns.target
-    proof_override = None if ns.lean_proof_valid is None else (ns.lean_proof_valid == "true")
     state_path = _resolve_state_path(ns.state_file)
-    allow_dev = bool(ns.allow_insecure_dev_key) or not bool(ns.require_explicit_key)
+    allow_dev = bool(ns.allow_insecure_dev_key)
     issued_at = int(time.time()) if ns.ttl_seconds is not None else None
+    proof_flag = False if ns.frontier_exception else None
 
     try:
         if state_path is not None:
             gate = LeanMcpGate(
                 secret_key=secret,
+                supervisor_secret_key=sup_secret,
                 initial_deck_epoch=1 if ns.epoch is None else ns.epoch,
                 check_lean_kernel=False,
                 state_path=state_path,
@@ -380,7 +476,7 @@ def _run_mcp_mint_subcommand(sub_argv: Sequence[str]) -> int:
                 minter_key_id=ns.minter_key_id,
                 key_epoch=ns.key_epoch,
                 default_ttl_seconds=ns.ttl_seconds,
-                require_explicit_key=ns.require_explicit_key,
+                require_explicit_key=True,
                 allow_insecure_dev_key=allow_dev,
             )
             env = gate.mint(
@@ -389,13 +485,16 @@ def _run_mcp_mint_subcommand(sub_argv: Sequence[str]) -> int:
                 token_epoch=ns.epoch,
                 tool_name=ns.tool_name,
                 nonce=ns.nonce,
-                lean_proof_valid=proof_override,
+                lean_proof_valid=proof_flag,
+                lean_proof_source=ns.lean_proof,
                 is_frontier_exception=ns.frontier_exception,
                 human_supervisor_signed=ns.supervisor_signed,
                 human_supervisor_id=ns.supervisor_id,
                 supervisor_private_key=sup_priv,
                 supervisor_ed25519_sig=ns.supervisor_sig,
                 supervisor_key_id=ns.supervisor_key_id,
+                supervisor_secret_key=sup_secret,
+                supervisor_hmac_sha256=ns.supervisor_hmac,
                 key_epoch=ns.key_epoch,
                 issued_at_unix=issued_at,
                 ttl_seconds=ns.ttl_seconds,
@@ -408,7 +507,8 @@ def _run_mcp_mint_subcommand(sub_argv: Sequence[str]) -> int:
                 token_epoch=1 if ns.epoch is None else ns.epoch,
                 tool_name=ns.tool_name,
                 nonce=ns.nonce,
-                lean_proof_valid=proof_override,
+                lean_proof_valid=proof_flag,
+                lean_proof_source=ns.lean_proof,
                 is_frontier_exception=ns.frontier_exception,
                 human_supervisor_signed=ns.supervisor_signed,
                 human_supervisor_id=ns.supervisor_id,
@@ -418,10 +518,12 @@ def _run_mcp_mint_subcommand(sub_argv: Sequence[str]) -> int:
                 supervisor_private_key=sup_priv,
                 supervisor_ed25519_sig=ns.supervisor_sig,
                 supervisor_key_id=ns.supervisor_key_id,
+                supervisor_secret_key=sup_secret,
+                supervisor_hmac_sha256=ns.supervisor_hmac,
                 key_epoch=ns.key_epoch,
                 issued_at_unix=issued_at,
                 ttl_seconds=ns.ttl_seconds,
-                require_explicit_key=ns.require_explicit_key,
+                require_explicit_key=True,
                 allow_insecure_dev_key=allow_dev,
             )
     except (OSError, PermissionError, TypeError, ValueError) as exc:
@@ -468,6 +570,11 @@ def _run_mcp_verify_subcommand(sub_argv: Sequence[str]) -> int:
         help="Actual 64-hex protocol SHA-256 to verify against protocol_sha256.",
     )
     parser.add_argument(
+        "--no-payload-binding",
+        action="store_true",
+        help="Explicitly skip payload SHA-256 binding check (dry-run inspection only).",
+    )
+    parser.add_argument(
         "--epoch",
         type=int,
         default=None,
@@ -500,7 +607,13 @@ def _run_mcp_verify_subcommand(sub_argv: Sequence[str]) -> int:
         "--secret-key",
         type=str,
         default=None,
-        help="Shared HMAC secret key (defaults to LEAN_MCP_SECRET_KEY or dev key).",
+        help="Shared HMAC secret key (or LEAN_MCP_SECRET_KEY; required unless --allow-insecure-dev-key).",
+    )
+    parser.add_argument(
+        "--supervisor-secret-key",
+        type=str,
+        default=None,
+        help="Distinct HMAC secret key for supervisor co-signature verification (or LEAN_MCP_SUPERVISOR_SECRET_KEY).",
     )
     parser.add_argument(
         "--auth-mode",
@@ -527,9 +640,20 @@ def _run_mcp_verify_subcommand(sub_argv: Sequence[str]) -> int:
         help="Minimum non-revoked signing key epoch.",
     )
     parser.add_argument(
+        "--check-lean-kernel",
+        action="store_true",
+        help="Cross-check against compiled lab-verify-lean binary (fails closed if missing).",
+    )
+    parser.add_argument(
+        "--lean-kernel-bin",
+        type=Path,
+        default=None,
+        help="Explicit path to compiled lab-verify-lean / autolab-lean binary.",
+    )
+    parser.add_argument(
         "--require-explicit-key",
         action="store_true",
-        help="Reject fallback to DEFAULT_MCP_SECRET_KEY unless --allow-insecure-dev-key is set.",
+        help="Require explicit non-dev key (enabled by default unless --allow-insecure-dev-key is set).",
     )
     parser.add_argument(
         "--allow-insecure-dev-key",
@@ -548,24 +672,28 @@ def _run_mcp_verify_subcommand(sub_argv: Sequence[str]) -> int:
         print("ERROR: mcp-verify requires an envelope JSON file path", file=sys.stderr)
         return 1
 
-    explicit_secret = ns.secret_key or os.environ.get("LEAN_MCP_SECRET_KEY")
-    secret = explicit_secret if explicit_secret is not None else DEFAULT_MCP_SECRET_KEY
-    minter_pub = ns.minter_public_key or os.environ.get("LEAN_MCP_MINTER_PUBLIC_KEY")
-    sup_pub = ns.supervisor_public_key or os.environ.get("LEAN_MCP_SUPERVISOR_PUBLIC_KEY")
+    secret = _resolve_secret(ns.secret_key, "LEAN_MCP_SECRET_KEY")
+    sup_secret = _resolve_secret(ns.supervisor_secret_key, "LEAN_MCP_SUPERVISOR_SECRET_KEY")
+    minter_pub = _resolve_secret(ns.minter_public_key, "LEAN_MCP_MINTER_PUBLIC_KEY")
+    sup_pub = _resolve_secret(ns.supervisor_public_key, "LEAN_MCP_SUPERVISOR_PUBLIC_KEY")
     state_path = _resolve_state_path(ns.state_file)
-    allow_dev = bool(ns.allow_insecure_dev_key) or not bool(ns.require_explicit_key)
+    allow_dev = bool(ns.allow_insecure_dev_key)
+    require_binding = not bool(ns.no_payload_binding)
 
     try:
         if state_path is not None:
             gate = LeanMcpGate(
                 secret_key=secret if minter_pub is None else None,
+                supervisor_secret_key=sup_secret,
                 initial_deck_epoch=1 if ns.epoch is None else ns.epoch,
+                check_lean_kernel=ns.check_lean_kernel,
+                lean_kernel_bin=ns.lean_kernel_bin,
                 state_path=state_path,
                 auth_mode=ns.auth_mode,
                 minter_public_key=minter_pub,
                 supervisor_public_key=sup_pub,
                 min_active_key_epoch=ns.min_active_key_epoch,
-                require_explicit_key=ns.require_explicit_key,
+                require_explicit_key=True,
                 allow_insecure_dev_key=allow_dev,
             )
             if ns.epoch is not None and not state_path.exists():
@@ -574,6 +702,8 @@ def _run_mcp_verify_subcommand(sub_argv: Sequence[str]) -> int:
                 env_path,
                 actual_protocol=ns.protocol,
                 actual_protocol_sha256=ns.protocol_sha256,
+                require_payload_binding=require_binding,
+                supervisor_secret_key=sup_secret,
                 mutates_deck_state=ns.mutates_deck_state,
                 defer_unsigned_frontier=ns.defer_unsigned_frontier,
                 stateless_dry_run=ns.stateless_dry_run,
@@ -582,13 +712,17 @@ def _run_mcp_verify_subcommand(sub_argv: Sequence[str]) -> int:
             verdict = verify_mcp_envelope(
                 env_path,
                 secret_key=secret if minter_pub is None else None,
+                supervisor_secret_key=sup_secret,
                 current_deck_epoch=1 if ns.epoch is None else ns.epoch,
                 actual_protocol=ns.protocol,
                 actual_protocol_sha256=ns.protocol_sha256,
+                require_payload_binding=require_binding,
+                check_lean_kernel=ns.check_lean_kernel,
+                lean_kernel_bin=ns.lean_kernel_bin,
                 minter_public_key=minter_pub,
                 supervisor_public_key=sup_pub,
                 min_active_key_epoch=ns.min_active_key_epoch,
-                require_explicit_key=ns.require_explicit_key,
+                require_explicit_key=True,
                 allow_insecure_dev_key=allow_dev,
             )
     except (OSError, PermissionError, TimeoutError, TypeError, ValueError) as exc:
@@ -596,7 +730,13 @@ def _run_mcp_verify_subcommand(sub_argv: Sequence[str]) -> int:
         return 1
 
     if ns.json:
-        print(json.dumps(verdict.to_dict(), indent=2))
+        payload = verdict.to_dict()
+        try:
+            parsed_env = LeanMcpEnvelope.from_json(env_path)
+            payload["static_check_passed"] = bool(parsed_env.static_check_passed and verdict.passed)
+        except (OSError, ValueError, json.JSONDecodeError):
+            payload["static_check_passed"] = False
+        print(json.dumps(payload, indent=2))
     else:
         status = "PASS" if verdict.passed else f"FAIL ({verdict.layer})"
         print(f"{status}: {verdict.reason}")
@@ -616,23 +756,29 @@ def main(argv: Sequence[str] | None = None, *, default_candidates: Path | None =
     state_path = _resolve_state_path(args.mcp_state)
 
     if args.mcp_mint is not None:
-        secret = args.mcp_secret_key or os.environ.get("LEAN_MCP_SECRET_KEY", DEFAULT_MCP_SECRET_KEY)
+        secret = _resolve_secret(args.mcp_secret_key, "LEAN_MCP_SECRET_KEY")
+        sup_secret = _resolve_secret(args.mcp_supervisor_secret_key, "LEAN_MCP_SUPERVISOR_SECRET_KEY")
+        allow_dev = bool(args.allow_insecure_dev_key)
         try:
             if state_path is not None:
                 gate = LeanMcpGate(
                     secret_key=secret,
+                    supervisor_secret_key=sup_secret,
                     initial_deck_epoch=1 if args.mcp_epoch is None else args.mcp_epoch,
                     check_lean_kernel=False,
                     state_path=state_path,
+                    allow_insecure_dev_key=allow_dev,
                 )
                 env = gate.mint(args.mcp_mint, token_epoch=args.mcp_epoch)
             else:
                 env = mint_mcp_envelope(
                     args.mcp_mint,
                     secret_key=secret,
+                    supervisor_secret_key=sup_secret,
                     token_epoch=1 if args.mcp_epoch is None else args.mcp_epoch,
+                    allow_insecure_dev_key=allow_dev,
                 )
-        except (OSError, PermissionError, ValueError) as exc:
+        except (OSError, PermissionError, TypeError, ValueError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
         rendered = env.to_json(indent=2)
@@ -644,35 +790,64 @@ def main(argv: Sequence[str] | None = None, *, default_candidates: Path | None =
         return 0
 
     if args.mcp_verify is not None:
-        secret = args.mcp_secret_key or os.environ.get("LEAN_MCP_SECRET_KEY", DEFAULT_MCP_SECRET_KEY)
-        if state_path is not None:
-            gate = LeanMcpGate(
-                secret_key=secret,
-                initial_deck_epoch=1 if args.mcp_epoch is None else args.mcp_epoch,
-                state_path=state_path,
-            )
-            verdict = gate.verify(
-                args.mcp_verify,
-                actual_protocol=args.mcp_protocol,
-                mutates_deck_state=args.mutates_deck_state,
-                stateless_dry_run=args.stateless_dry_run,
-            )
-        else:
-            verdict = verify_mcp_envelope(
-                args.mcp_verify,
-                secret_key=secret,
-                current_deck_epoch=1 if args.mcp_epoch is None else args.mcp_epoch,
-                actual_protocol=args.mcp_protocol,
-            )
+        secret = _resolve_secret(args.mcp_secret_key, "LEAN_MCP_SECRET_KEY")
+        sup_secret = _resolve_secret(args.mcp_supervisor_secret_key, "LEAN_MCP_SUPERVISOR_SECRET_KEY")
+        allow_dev = bool(args.allow_insecure_dev_key)
+        require_binding = not bool(args.no_payload_binding)
+        try:
+            if state_path is not None:
+                gate = LeanMcpGate(
+                    secret_key=secret,
+                    supervisor_secret_key=sup_secret,
+                    initial_deck_epoch=1 if args.mcp_epoch is None else args.mcp_epoch,
+                    check_lean_kernel=args.check_lean_kernel,
+                    lean_kernel_bin=args.lean_kernel_bin,
+                    state_path=state_path,
+                    allow_insecure_dev_key=allow_dev,
+                )
+                verdict = gate.verify(
+                    args.mcp_verify,
+                    actual_protocol=args.mcp_protocol,
+                    require_payload_binding=require_binding,
+                    supervisor_secret_key=sup_secret,
+                    mutates_deck_state=args.mutates_deck_state,
+                    stateless_dry_run=args.stateless_dry_run,
+                )
+            else:
+                verdict = verify_mcp_envelope(
+                    args.mcp_verify,
+                    secret_key=secret,
+                    supervisor_secret_key=sup_secret,
+                    current_deck_epoch=1 if args.mcp_epoch is None else args.mcp_epoch,
+                    actual_protocol=args.mcp_protocol,
+                    require_payload_binding=require_binding,
+                    check_lean_kernel=args.check_lean_kernel,
+                    lean_kernel_bin=args.lean_kernel_bin,
+                    allow_insecure_dev_key=allow_dev,
+                )
+        except (OSError, PermissionError, TimeoutError, TypeError, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
         if args.json:
-            print(json.dumps(verdict.to_dict(), indent=2))
+            payload = verdict.to_dict()
+            try:
+                parsed_env = LeanMcpEnvelope.from_json(args.mcp_verify)
+                payload["static_check_passed"] = bool(parsed_env.static_check_passed and verdict.passed)
+            except (OSError, ValueError, json.JSONDecodeError):
+                payload["static_check_passed"] = False
+            print(json.dumps(payload, indent=2))
         else:
             status = "PASS" if verdict.passed else f"FAIL ({verdict.layer})"
             print(f"{status}: {verdict.reason}")
         return 0 if verdict.passed else 1
 
     if args.lean is not None:
-        verdict = verify_lean(args.lean, run_toolchain=True)
+        verdict = verify_lean(
+            args.lean,
+            project_dir=args.lean_project,
+            static_only=args.lean_static_only,
+            run_leanchecker=args.leanchecker,
+        )
         if args.json:
             print(json.dumps(verdict.to_dict(), indent=2))
         else:
@@ -703,6 +878,10 @@ def main(argv: Sequence[str] | None = None, *, default_candidates: Path | None =
             counterexample_cons=ce_cons,
             schema=db_schema,
             allow_cross_join=args.allow_cross_join,
+            max_vm_steps=args.max_vm_steps,
+            timeout_s=args.timeout_s,
+            max_rows=args.max_rows,
+            max_value_bytes=args.max_value_bytes,
         )
         if args.json:
             print(json.dumps(verdict.to_dict(), indent=2))
@@ -717,6 +896,10 @@ def main(argv: Sequence[str] | None = None, *, default_candidates: Path | None =
         db_path=args.db,
         as_json=args.json,
         allow_cross_join=args.allow_cross_join,
+        max_vm_steps=args.max_vm_steps,
+        timeout_s=args.timeout_s,
+        max_rows=args.max_rows,
+        max_value_bytes=args.max_value_bytes,
     )
 
 

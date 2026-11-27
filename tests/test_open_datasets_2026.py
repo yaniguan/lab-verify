@@ -448,12 +448,12 @@ def test_lean_workbook_adapter_enforces_zero_sorry_axiom_and_signature_integrity
         "theorem lean_workbook_plus_2 (x : Real) : x^2 - 2*x - 24 < 0 <-> x ∈ Set.Ioo (-4) 6"
     )
 
-    # Verified tactic passes static `lean_gate` soundness checks
-    v_ok = verify_open_lean_item(item, item.reference_proof)
+    # Verified tactic passes static `lean_gate` soundness checks when static_only=True is explicit
+    v_ok = verify_open_lean_item(item, item.reference_proof, static_only=True)
     assert v_ok.passed is True
 
     # Raw `sorry` proof fails at `soundness`
-    v_sorry = verify_open_lean_item(item, "sorry")
+    v_sorry = verify_open_lean_item(item, "sorry", static_only=True)
     assert not v_sorry.passed and v_sorry.layer == "soundness" and "sorry" in v_sorry.reason
 
     # Custom `axiom` smuggling fails at `soundness`
@@ -462,17 +462,17 @@ def test_lean_workbook_adapter_enforces_zero_sorry_axiom_and_signature_integrity
         "axiom magic_ineq (x : Real) : x^2 - 2*x - 24 < 0 <-> x ∈ Set.Ioo (-4) 6\n"
         "theorem lean_workbook_plus_2 (x : Real) : x^2 - 2*x - 24 < 0 <-> x ∈ Set.Ioo (-4) 6 := magic_ineq x\n"
     )
-    v_axiom = verify_open_lean_item(item, axiom_bypass)
+    v_axiom = verify_open_lean_item(item, axiom_bypass, static_only=True)
     assert not v_axiom.passed and v_axiom.layer == "soundness" and "axiom" in v_axiom.reason
 
     # `#exit` directive bypass fails at `soundness`
     exit_bypass = assemble_lean_submission(item, "nlinarith") + "\n#exit\n"
-    v_exit = verify_open_lean_item(item, exit_bypass)
+    v_exit = verify_open_lean_item(item, exit_bypass, static_only=True)
     assert not v_exit.passed and v_exit.layer == "soundness" and "#exit" in v_exit.reason
 
     # Goal-swapping / altering the benchmark theorem statement fails at `schema`
     tampered_stmt = "import Mathlib\ntheorem lean_workbook_plus_2 (x : Real) : x = x := rfl\n"
-    v_tamper = verify_open_lean_item(item, tampered_stmt)
+    v_tamper = verify_open_lean_item(item, tampered_stmt, static_only=True)
     assert not v_tamper.passed and v_tamper.layer == "schema"
     assert "signature" in v_tamper.reason
 
@@ -493,8 +493,12 @@ def test_putnambench_proofnet_minif2f_formalmath_and_numinamath_lean4_adapters(t
     assert len(pb_items) == 1
     assert pb_items[0].item_id == "putnam_1962_a1"
     assert "convex quadrilateral" in pb_items[0].informal_statement
-    assert not verify_open_lean_item(pb_items[0], None).passed
-    assert verify_open_lean_item(pb_items[0], "obtain ⟨x, hx⟩ := hS.nonempty\nexact ⟨S.erase x, Set.erase_subset x S, by simpa using hS⟩").passed
+    assert not verify_open_lean_item(pb_items[0], None, static_only=True).passed
+    assert verify_open_lean_item(
+        pb_items[0],
+        "obtain ⟨x, hx⟩ := hS.nonempty\nexact ⟨S.erase x, Set.erase_subset x S, by simpa using hS⟩",
+        static_only=True,
+    ).passed
 
     pn_items = load_lean_benchmark_items(
         "proofnet-lean4",
@@ -551,10 +555,12 @@ def test_putnambench_proofnet_minif2f_formalmath_and_numinamath_lean4_adapters(t
             "algebra_569189": "positivity",
             "nm-001": nm_items[0].reference_proof,
         },
+        static_only=True,
     )
     assert batch_report["total"] == 4
     assert batch_report["passed"] == 4
     assert batch_report["failed"] == 0
+    assert all(r["reason"] == "static_only" for r in batch_report["results"])
 
 
 # ---------------------------------------------------------------------------
@@ -618,3 +624,131 @@ def test_fetch_open_benchmarks_offline_smoke_and_mocked_fetch(tmp_path: Path, ca
     assert fetched[0]["records_saved"] == 2
     assert fetched[0]["verification"]["gold_readonly_valid"] == 2
     assert (tmp_path / "manifest.json").exists()
+    assert demo_report["checks"]["lean_workbook_proved"]["verification_mode"] == "static_only"
+    assert demo_report["checks"]["proofnet_lean4_proved"]["verification_mode"] == "static_only"
+
+
+# ---------------------------------------------------------------------------
+# 5. Issue #32 & Issue #33 Live Lean 4 Compilation, Fail-Closed CLI, & EHRSQL Real Report
+# ---------------------------------------------------------------------------
+
+
+def test_issue_32_missing_lean_fails_closed_unless_static_only(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from lab_verify.cli import main as cli_main
+    from lab_verify.lean_gate import verify_lean
+
+    wrong_file = tmp_path / "wrong_rfl.lean"
+    wrong_file.write_text("theorem bad_comm (a b : Nat) : a + b = b + a := rfl\n", encoding="utf-8")
+
+    monkeypatch.setenv("PATH", "")
+    verdict = verify_lean(wrong_file)
+    assert verdict.passed is False
+    assert verdict.layer == "execution"
+
+    rc = cli_main(["--lean", str(wrong_file)])
+    assert rc == 1
+
+    # Explicit static_only=True returns "static_only" reason instead of claiming kernel verification
+    v_static = verify_lean(wrong_file, static_only=True)
+    assert v_static.passed is True
+    assert v_static.reason == "static_only"
+
+
+def test_issue_32_live_lean4_compilation_axioms_and_relative_cli_path(tmp_path: Path):
+    import os
+    import shutil
+    from lab_verify.cli import main as cli_main
+    from lab_verify.lean_gate import verify_lean
+    from lab_verify.open_benchmarks import OpenLeanBenchmarkItem
+
+    lean_bin = shutil.which("lean")
+    if os.environ.get("REQUIRE_LIVE_LEAN") == "1":
+        assert lean_bin is not None, "REQUIRE_LIVE_LEAN=1 set in CI, so lean must be installed on PATH"
+    if lean_bin is None:
+        pytest.skip("Lean 4 compiler not on PATH in Python-only test environment")
+
+    comm_item = OpenLeanBenchmarkItem(
+        dataset_id="lean-workbook",
+        item_id="core_nat_add_comm",
+        header="",
+        formal_statement="theorem core_nat_add_comm (a b : Nat) : a + b = b + a := by sorry",
+    )
+
+    # 1. Unproved `rfl` on `a + b = b + a` MUST FAIL live compilation
+    v_rfl = verify_open_lean_item(comm_item, "rfl")
+    assert v_rfl.passed is False
+    assert v_rfl.layer == "execution"
+
+    # 2. Custom tactic calling `mkSorry` (`sorryAx` without spelling `sorry` or `admit`) MUST FAIL axiom check
+    sneaky_admit = (
+        "import Lean.Elab.Tactic.Basic\n"
+        "open Lean Meta Elab Tactic in\n"
+        'elab "trust_me" : tactic => do\n'
+        "  let g <- getMainGoal\n"
+        "  let t <- g.getType\n"
+        "  let e <- mkSorry t false\n"
+        "  g.assign e\n"
+        "theorem core_nat_add_comm (a b : Nat) : a + b = b + a := by trust_me\n"
+    )
+    assert verify_lean(sneaky_admit, static_only=True).passed is True
+    v_admit = verify_open_lean_item(comm_item, sneaky_admit)
+    assert v_admit.passed is False
+    assert "sorryAx" in " ".join([v_admit.reason, *v_admit.diagnostics])
+
+    # 3. Custom `axiom` smuggling MUST FAIL
+    v_ax = verify_lean(
+        "axiom fake_comm (a b : Nat) : a + b = b + a\n"
+        "theorem t (a b : Nat) : a + b = b + a := fake_comm a b\n"
+    )
+    assert v_ax.passed is False
+
+    # 4. Valid `omega` proof PASSES both `verify_open_lean_item` and `verify_lean(..., run_leanchecker=True)`
+    v_omega = verify_open_lean_item(comm_item, "omega")
+    assert v_omega.passed is True
+    v_checker = verify_lean(
+        "theorem add_comm_ok (a b : Nat) : a + b = b + a := by omega\n"
+        "theorem em_ok (p : Prop) : p ∨ ¬ p := Classical.em p\n",
+        run_leanchecker=(shutil.which("leanchecker") is not None),
+    )
+    assert v_checker.passed is True
+
+    # 5. `lab-verify --lean lean/LabVerifyLean.lean` works with relative path from repo root
+    old_cwd = Path.cwd()
+    try:
+        os.chdir(REPO_ROOT)
+        assert cli_main(["--lean", "lean/LabVerifyLean.lean"]) == 0
+    finally:
+        os.chdir(old_cwd)
+
+
+def test_issue_33_committed_ehrsql_2024_real_results_and_readme_sync():
+    report_path = REPO_ROOT / "results" / "ehrsql_2024_real.json"
+    assert report_path.exists(), "results/ehrsql_2024_real.json must be committed"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert report["licenses"]["database"]["spdx_license"] == "ODbL-1.0"
+    assert report["licenses"]["questions_and_sql"]["spdx_license"] == "CC-BY-4.0"
+    assert report["database_summary"]["num_tables"] == 17
+    assert report["database_summary"]["total_rows"] > 300_000
+
+    ehr = report["ehrsql_2024_valid"]
+    assert ehr["total_items"] == 1163
+    assert ehr["answerable_total"] == 931
+    assert ehr["gold_vs_gold_passed"] == 931
+    assert ehr["unanswerable_total"] == 232
+    assert ehr["abstention_passed"] == 232
+    assert ehr["gold_vs_gold_failed"] == 0
+    assert ehr["abstention_failed"] == 0
+    assert ehr["failures"] == []
+
+    bird = report["bird_mini_dev_sqlite"]
+    assert bird["total_items"] == 500
+    assert bird["strict_join_and_cte_passed"] == 500
+
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "931/931" in readme
+    assert "232/232" in readme
+    assert "scripts/run_ehrsql_real.py" in readme
