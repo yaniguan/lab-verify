@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from .lean_gate import strip_lean_comments, verify_lean
+from .lean_gate import (
+    ALLOWED_LEAN_AXIOMS,
+    extract_lean_declarations,
+    run_lablean_protocol_checker,
+    strip_lean_comments,
+    verify_lean,
+)
 from .open_benchmarks import (
     OPEN_BENCHMARK_SPECS,
     OpenBenchmarkSpec,
@@ -29,6 +35,7 @@ from .open_benchmarks import (
     parse_proofnet_items,
     parse_putnambench_items,
     parse_spider2_lite_items,
+    postprocess_ehrsql_sql,
     to_candidates_benchmark,
     verify_open_lean_item,
     verify_open_sql_item,
@@ -44,6 +51,7 @@ from .mcp_gate import (
     compute_envelope_hmac,
     compute_protocol_sha256,
     compute_supervisor_cosign_payload,
+    compute_supervisor_hmac,
     ed25519_public_key_from_private,
     ed25519_sign,
     ed25519_verify,
@@ -113,6 +121,7 @@ def verify(domain: str, target: Any, **kwargs: Any) -> VerifyVerdict:
 
 
 __all__ = [
+    "ALLOWED_LEAN_AXIOMS",
     "AUTH_MODE_ED25519",
     "AUTH_MODE_HMAC",
     "BatchGateEvaluator",
@@ -150,12 +159,14 @@ __all__ = [
     "compute_envelope_hmac",
     "compute_protocol_sha256",
     "compute_supervisor_cosign_payload",
+    "compute_supervisor_hmac",
     "ed25519_public_key_from_private",
     "ed25519_sign",
     "ed25519_verify",
     "evaluate_open_lean_batch",
     "evaluate_open_sql_batch",
     "expected_columns",
+    "extract_lean_declarations",
     "gate",
     "generate_ed25519_keypair",
     "get_open_benchmark_spec",
@@ -181,8 +192,10 @@ __all__ = [
     "parse_proofnet_items",
     "parse_putnambench_items",
     "parse_spider2_lite_items",
+    "postprocess_ehrsql_sql",
     "rows_equal",
     "run",
+    "run_lablean_protocol_checker",
     "run_query",
     "sign_supervisor_cosignature",
     "strip_lean_comments",

@@ -1,0 +1,81 @@
+{
+  "benchmark": "ehrsql_2024_real_mimic_iv_demo",
+  "data_source": "real_downloaded",
+  "command": "python scripts/run_ehrsql_real.py",
+  "licenses": {
+    "database": {
+      "name": "MIMIC-IV Clinical Database Demo v2.2",
+      "spdx_license": "ODbL-1.0",
+      "url": "https://physionet.org/static/published-projects/mimic-iv-demo/mimic-iv-clinical-database-demo-2.2.zip",
+      "zip_sha256": "97301a03820e8f41af211cf3462ddc19aefe75bbed05f11753859affaafeb8ec"
+    },
+    "questions_and_sql": {
+      "name": "EHRSQL-2024 (glee4810/ehrsql-2024 valid/annotated.json)",
+      "spdx_license": "CC-BY-4.0",
+      "url": "https://github.com/glee4810/ehrsql-2024",
+      "schema_sql_sha256": "2659dd7c8106028994000754e5bd35a1fe21f2d5c85a086ed040bd33f37e82e5",
+      "valid_annotated_sha256": "9d6bd4d6cadb50975c1aabf0d1dfb9c183ed391dcf086d7c9958dec95ac46ccb"
+    }
+  },
+  "database_summary": {
+    "num_tables": 17,
+    "total_rows": 317875,
+    "table_row_counts": {
+      "admissions": 122,
+      "chartevents": 32014,
+      "cost": 36450,
+      "d_icd_diagnoses": 106308,
+      "d_icd_procedures": 85254,
+      "d_items": 3522,
+      "d_labitems": 1593,
+      "diagnoses_icd": 1608,
+      "icustays": 86,
+      "inputevents": 8938,
+      "labevents": 28816,
+      "microbiologyevents": 1109,
+      "outputevents": 5410,
+      "patients": 94,
+      "prescriptions": 5639,
+      "procedures_icd": 387,
+      "transfers": 525
+    }
+  },
+  "execution_limits": {
+    "max_vm_steps": 50000000,
+    "timeout_s": 10.0,
+    "max_rows": 100000,
+    "strict_joins": true,
+    "allow_cross_join": false
+  },
+  "ehrsql_2024_valid": {
+    "total_items": 1163,
+    "answerable_total": 931,
+    "answerable_outer_order_by": 176,
+    "gold_vs_gold_passed": 931,
+    "gold_vs_gold_ambiguous_limit_ties": 0,
+    "gold_vs_gold_failed": 0,
+    "unanswerable_total": 232,
+    "abstention_passed": 232,
+    "abstention_failed": 0,
+    "stopped_by_layer": {
+      "parse": 0,
+      "read-only": 0,
+      "schema": 0,
+      "execution": 0
+    },
+    "failures": []
+  },
+  "bird_mini_dev_sqlite": {
+    "dataset_id": "bird-mini-dev-hf",
+    "spdx_license": "CC-BY-SA-4.0",
+    "eval_only": true,
+    "total_items": 500,
+    "outer_order_by_count": 169,
+    "parse_passed": 500,
+    "readonly_passed": 500,
+    "strict_join_and_cte_passed": 500,
+    "failures": [],
+    "jsonl_sha256": "926af2a0d1b47e5d0d15a7aa8a34d4721007f4550a881555b6a89496b54a2606"
+  },
+  "runtime_seconds": 14.631
+}

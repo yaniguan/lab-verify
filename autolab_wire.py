@@ -1,9 +1,9 @@
 """Auto-Lab 15-repository wire node (`autolab-wire/v1`) for `lab-verify` (Layer L4).
 
 Enforces the 4-layer read-only SQLite gate (`lab_verify.sql_gate`), validates
-static protocol/AST soundness, supports overnight unsigned frontier deferral
+static protocol/AST/volume soundness, supports overnight unsigned frontier deferral
 (`L4_VERIFY_FRONTIER_DEFERRED`) plus daytime human supervisor co-sign release
-(`cosign_deferred_packet`), and mints `lean-mcp/v1` zero-trust hardware
+(`cosign_deferred_packet`), and mints fail-closed `lean-mcp/v1` zero-trust hardware
 capability envelopes (`lab_verify.mcp_gate.LeanMcpGate`) for downstream
 `stepbot` execution, pairing pre-execution verification (`lab-rehearsal`,
 `lab-verify`) with post-execution causal attribution (`lab-attrib`).
@@ -12,7 +12,7 @@ capability envelopes (`lab_verify.mcp_gate.LeanMcpGate`) for downstream
 from __future__ import annotations
 
 import copy
-import math
+import hmac
 from pathlib import Path
 import sys
 from typing import Any, Mapping, Sequence
@@ -26,19 +26,11 @@ INVARIANT_NAME = "autonomous_wire_envelope_soundness"
 FIRST_PRINCIPLES_NOTE = (
     "Read-only AST plus SQLite query_only and authorizer isolation blocks mutating "
     "or schema-invalid SQL before execution, while zero-click hardware MCP dispatch "
-    "requires canonical HMAC-SHA256 or Ed25519 authenticity, exact SHA-256 protocol "
-    "binding, active key-rotation epoch, fresh deck epoch, single-use nonce, unexpired "
-    "TTL window, and a valid Lean proof certificate or role-separated supervisor co-signature."
+    "requires canonical HMAC-SHA256 or Ed25519 authenticity with an explicit non-dev key, "
+    "exact SHA-256 protocol binding, active key-rotation epoch, fresh deck epoch, "
+    "single-use nonce, unexpired TTL window, and a verified protocol/Lean proof certificate "
+    "or role-separated cryptographic supervisor co-signature."
 )
-
-DEFAULT_WIRE_PROTOCOL_IR: dict[str, Any] = {
-    "steps": [
-        {"op": "pick_up_tip"},
-        {"op": "aspirate", "loc": "res:1", "vol": 50.0},
-        {"op": "dispense", "loc": "plate:A1", "vol": 50.0},
-        {"op": "drop_tip"},
-    ]
-}
 
 REPO_DIR = Path(__file__).resolve().parent
 SRC_DIR = REPO_DIR / "src"
@@ -50,10 +42,13 @@ from lab_verify.mcp_gate import (  # noqa: E402
     LeanMcpEnvelope,
     LeanMcpGate,
     _infer_static_proof_and_bounds,
+    compute_protocol_sha256,
+    compute_supervisor_hmac,
+    ed25519_public_key_from_private,
     mint_mcp_envelope,
+    verify_supervisor_cosignature,
 )
-from lab_verify.protocol_gate import verify_protocol  # noqa: E402
-from lab_verify.sql_gate import build_db, verify_sql  # noqa: E402
+from lab_verify.sql_gate import SCHEMA, build_db, open_readonly_db, verify_sql  # noqa: E402
 from lab_verify.verdict import VerifyVerdict  # noqa: E402
 
 
@@ -68,52 +63,86 @@ def _init_wire_packet(packet: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _evaluate_readonly_sql(out: Mapping[str, Any]) -> VerifyVerdict:
-    """Run `lab-verify`'s 4-layer read-only SQLite gate against the synthetic lab DB."""
-    sql_query = (
-        DEFAULT_SQL_QUERY
-        if "sql_query" not in out or out["sql_query"] is None
-        else out["sql_query"]
-    )
+def _evaluate_readonly_sql(
+    out: Mapping[str, Any],
+    *,
+    db_path: str | Path | None = None,
+) -> VerifyVerdict:
+    """Run `lab-verify`'s 4-layer read-only SQLite gate against `db_path` or the synthetic lab DB."""
+    effective_db = db_path if db_path is not None else out.get("db_path")
+    has_explicit_sql = "sql_query" in out and out["sql_query"] is not None
+    if has_explicit_sql:
+        sql_query = out["sql_query"]
+    elif effective_db is not None:
+        sql_query = "SELECT 1"
+    else:
+        sql_query = DEFAULT_SQL_QUERY
+
     gold_sql = out.get("gold_sql")
-    con = build_db()
+    max_vm_steps = int(out.get("max_vm_steps", 5_000_000))
+    timeout_s = float(out.get("timeout_s", 2.0))
+    max_rows = int(out.get("max_rows", 10_000))
+    max_value_bytes = int(out.get("max_value_bytes", 1_000_000))
+
+    if effective_db is not None:
+        try:
+            con, db_schema = open_readonly_db(effective_db)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            return VerifyVerdict(
+                passed=False,
+                layer="schema",
+                reason=f"failed to open read-only SQLite db_path: {exc}",
+                diagnostics=[str(exc)],
+            )
+    else:
+        con = build_db()
+        db_schema = SCHEMA
+
     try:
         return verify_sql(
             con,
             sql_query,
             gold_sql=gold_sql if isinstance(gold_sql, str) else None,
+            schema=db_schema,
             allow_cross_join=bool(out.get("allow_cross_join", False)),
             allow_recursive_cte=bool(out.get("allow_recursive_cte", True)),
+            max_vm_steps=max_vm_steps,
+            timeout_s=timeout_s,
+            max_rows=max_rows,
+            max_value_bytes=max_value_bytes,
         )
     finally:
         con.close()
 
 
-def _is_valid_stepbot_ir(ir: Mapping[str, Any]) -> bool:
-    steps = ir.get("steps")
-    if not isinstance(steps, list) or len(steps) == 0:
-        return False
-    for step in steps:
-        if not isinstance(step, Mapping):
-            return False
-        action = step.get("action")
-        if not isinstance(action, str) or not action.strip():
-            return False
-        vol = step.get("volume")
-        if vol is not None:
-            if isinstance(vol, bool) or not isinstance(vol, (int, float)):
-                return False
-            if not math.isfinite(float(vol)) or float(vol) <= 0:
-                return False
-    return True
+def _extract_explicit_max_transfer_ul(out: Mapping[str, Any]) -> float | None:
+    stepbot_compiled = (
+        out["stepbot_compiled"]
+        if isinstance(out.get("stepbot_compiled"), Mapping)
+        else {}
+    )
+    raw_bounds = (
+        out.get("envelope_bounds")
+        if isinstance(out.get("envelope_bounds"), Mapping)
+        else (
+            stepbot_compiled.get("envelope_bounds")
+            if isinstance(stepbot_compiled.get("envelope_bounds"), Mapping)
+            else None
+        )
+    )
+    if raw_bounds is not None and raw_bounds.get("max_transfer_ul") is not None:
+        val = raw_bounds["max_transfer_ul"]
+        if not isinstance(val, bool) and isinstance(val, (int, float)):
+            return float(val)
+    return None
 
 
 def _resolve_and_validate_protocol_target(
     out: Mapping[str, Any],
     *,
     explicit_python_code: str | None = None,
-) -> tuple[Any, bool, bool, dict[str, Any] | None, str | None]:
-    """Resolve `(protocol_target, static_proof_valid, ast_malicious_or_broken, inferred_bounds, err_reason)`."""
+) -> tuple[Any, bool, bool, bool, dict[str, Any] | None, str | None]:
+    """Resolve `(protocol_target, static_check_passed, proof_valid, ast_malicious_or_broken, inferred_bounds, err_reason)`."""
     stepbot_compiled = (
         out["stepbot_compiled"]
         if isinstance(out.get("stepbot_compiled"), Mapping)
@@ -125,60 +154,61 @@ def _resolve_and_validate_protocol_target(
         else {}
     )
     rehearsal_passed = rehearsal.get("passed") is not False
+    max_ul_limit = _extract_explicit_max_transfer_ul(out)
 
     py_candidate = explicit_python_code
     if py_candidate is None:
-        raw_py = out.get("compiled_python_code") or stepbot_compiled.get("python_code")
+        raw_py = out.get("compiled_python_code")
+        if not isinstance(raw_py, str):
+            raw_py = stepbot_compiled.get("python_code")
         if isinstance(raw_py, str):
             py_candidate = raw_py
 
     if py_candidate is not None:
-        py_ok, inferred_bounds = _infer_static_proof_and_bounds(py_candidate)
+        py_ok, inferred_bounds = _infer_static_proof_and_bounds(
+            py_candidate, max_transfer_ul_limit=max_ul_limit
+        )
         if not py_ok:
             return (
                 py_candidate,
                 False,
+                False,
                 True,
                 inferred_bounds,
-                "compiled Python script failed static AST safety or lacks def run(protocol)",
+                "compiled Python script failed static AST safety, lacks def run(protocol), or exceeds max_transfer_ul",
             )
         override = out.get("lean_proof_valid")
-        proof_ok = rehearsal_passed and (True if override is None else bool(override))
+        proof_ok = bool(py_ok and rehearsal_passed and (True if override is None else bool(override)))
         reason = None if proof_ok else "upstream rehearsal or Lean proof flag rejected protocol"
-        return py_candidate, proof_ok, False, inferred_bounds, reason
+        return py_candidate, True, proof_ok, False, inferred_bounds, reason
 
     if "protocol_yaml_dict" in rehearsal and rehearsal["protocol_yaml_dict"] is not None:
         ir = rehearsal["protocol_yaml_dict"]
-        if isinstance(ir, Mapping) and "steps" in ir:
-            steps = ir.get("steps")
-            if not isinstance(steps, list) or len(steps) == 0:
-                return ir, False, False, None, "protocol_yaml_dict steps list must be non-empty"
-            first = steps[0]
-            if isinstance(first, Mapping) and "action" in first and "op" not in first and "type" not in first:
-                ir_ok = _is_valid_stepbot_ir(ir)
-                err = None if ir_ok else "invalid stepbot protocol_yaml_dict step specification"
-            else:
-                v = verify_protocol(ir)
-                ir_ok = v.passed
-                err = None if ir_ok else v.reason
-        elif isinstance(ir, Sequence) and not isinstance(ir, (str, bytes)):
-            v = verify_protocol(ir)
-            ir_ok = v.passed
-            err = None if ir_ok else v.reason
-        else:
-            ir_ok = False
-            err = "protocol_yaml_dict must be a mapping or sequence of steps"
-
+        if not isinstance(ir, (Mapping, Sequence)) or isinstance(ir, (str, bytes)):
+            return (
+                ir,
+                False,
+                False,
+                True,
+                None,
+                "protocol_yaml_dict must be a mapping or sequence of steps",
+            )
+        ir_ok, inferred_bounds = _infer_static_proof_and_bounds(
+            ir, max_transfer_ul_limit=max_ul_limit
+        )
         override = out.get("lean_proof_valid")
-        proof_ok = ir_ok and rehearsal_passed and (True if override is None else bool(override))
-        if not proof_ok and err is None:
-            err = "upstream rehearsal or Lean proof check failed"
-        return ir, proof_ok, False, None, err
+        proof_ok = bool(ir_ok and rehearsal_passed and (True if override is None else bool(override)))
+        err = None if proof_ok else "protocol_yaml_dict failed static/volume check or upstream rehearsal"
+        return ir, ir_ok, proof_ok, not ir_ok, inferred_bounds, err
 
-    override = out.get("lean_proof_valid")
-    proof_ok = rehearsal_passed and (True if override is None else bool(override))
-    err = None if proof_ok else "upstream rehearsal or Lean proof check failed"
-    return DEFAULT_WIRE_PROTOCOL_IR, proof_ok, False, None, err
+    return (
+        None,
+        False,
+        False,
+        True,
+        None,
+        "wire packet carries no protocol (missing compiled_python_code, stepbot_compiled.python_code, or rehearsal.protocol_yaml_dict)",
+    )
 
 
 def _resolve_gate_for_packet(
@@ -193,12 +223,22 @@ def _resolve_gate_for_packet(
         )
         return mcp_gate, epoch
 
-    secret_key = out.get("mcp_secret_key") or DEFAULT_MCP_SECRET
+    raw_secret = out.get("mcp_secret_key")
+    secret_key = raw_secret if isinstance(raw_secret, (str, bytes)) and str(raw_secret).strip() else None
+    raw_sup_secret = out.get("mcp_supervisor_secret_key")
+    sup_secret_key = (
+        raw_sup_secret
+        if isinstance(raw_sup_secret, (str, bytes)) and str(raw_sup_secret).strip()
+        else None
+    )
+    allow_dev = bool(out.get("allow_insecure_dev_key", False))
     deck_epoch = int(out["deck_epoch"]) if out.get("deck_epoch") is not None else 1
     minter_priv = out.get("mcp_minter_private_key")
     state_path = out.get("mcp_state_path")
     gate = LeanMcpGate(
         secret_key=secret_key if minter_priv is None else None,
+        supervisor_secret_key=sup_secret_key,
+        supervisor_public_key=out.get("mcp_supervisor_public_key"),
         initial_deck_epoch=deck_epoch,
         check_lean_kernel=False,
         state_path=state_path,
@@ -206,8 +246,96 @@ def _resolve_gate_for_packet(
         minter_key_id=str(out.get("mcp_minter_key_id", "")),
         key_epoch=out.get("mcp_key_epoch"),
         default_ttl_seconds=out.get("mcp_ttl_seconds"),
+        require_explicit_key=True,
+        allow_insecure_dev_key=allow_dev,
     )
     return gate, gate.current_deck_epoch
+
+
+def _has_verifiable_packet_supervisor_signature(
+    out: Mapping[str, Any],
+    *,
+    protocol_target: Any,
+    bounds_map: Mapping[str, Any] | None,
+    epoch: int,
+    mcp_gate: LeanMcpGate | None,
+) -> bool:
+    """Return True ONLY when packet carries a verifiable cryptographic supervisor credential."""
+    if not bool(out.get("human_supervisor_signed", False)):
+        return False
+
+    nonce_raw = out.get("mcp_nonce")
+    sup_priv = out.get("mcp_supervisor_private_key")
+    minter_priv = out.get("mcp_minter_private_key") or (
+        mcp_gate._minter_private_key if mcp_gate is not None else None
+    )
+    if sup_priv is not None:
+        try:
+            sup_pub = ed25519_public_key_from_private(sup_priv, as_hex=True)
+            if minter_priv is not None:
+                minter_pub = ed25519_public_key_from_private(minter_priv, as_hex=True)
+                if hmac.compare_digest(str(sup_pub), str(minter_pub)):
+                    return False
+            return True
+        except (TypeError, ValueError, OSError):
+            return False
+
+    sup_ed_sig = str(out.get("mcp_supervisor_ed25519_sig", "")).strip()
+    sup_pub_key = out.get("mcp_supervisor_public_key") or (
+        mcp_gate._supervisor_public_key if mcp_gate is not None else None
+    )
+    if sup_ed_sig and sup_pub_key is not None and isinstance(nonce_raw, str) and nonce_raw.strip():
+        try:
+            proto_sha = compute_protocol_sha256(protocol_target)
+            return verify_supervisor_cosignature(
+                sup_pub_key,
+                sup_ed_sig,
+                nonce=nonce_raw.strip(),
+                token_epoch=epoch,
+                protocol_sha256=proto_sha,
+                envelope_bounds=bounds_map,
+            )
+        except (TypeError, ValueError, OSError):
+            return False
+
+    sup_secret = out.get("mcp_supervisor_secret_key") or (
+        mcp_gate._supervisor_secret_key if mcp_gate is not None else None
+    )
+    if sup_secret is None:
+        return False
+
+    minter_secret = out.get("mcp_secret_key") or (
+        mcp_gate._secret_key if mcp_gate is not None else None
+    )
+    sup_bytes = sup_secret if isinstance(sup_secret, bytes) else str(sup_secret).encode("utf-8")
+    if not sup_bytes:
+        return False
+    if not bool(out.get("allow_insecure_dev_key", False)) and hmac.compare_digest(
+        sup_bytes, DEFAULT_MCP_SECRET.encode("utf-8")
+    ):
+        return False
+    if minter_secret is not None:
+        minter_bytes = (
+            minter_secret if isinstance(minter_secret, bytes) else str(minter_secret).encode("utf-8")
+        )
+        if hmac.compare_digest(sup_bytes, minter_bytes):
+            return False
+
+    sup_hmac = str(out.get("mcp_supervisor_hmac_sha256", "")).strip()
+    if sup_hmac:
+        if not isinstance(nonce_raw, str) or not nonce_raw.strip():
+            return False
+        proto_sha = compute_protocol_sha256(protocol_target)
+        expected = compute_supervisor_hmac(
+            sup_secret,
+            nonce=nonce_raw.strip(),
+            token_epoch=epoch,
+            protocol_sha256=proto_sha,
+            envelope_bounds=bounds_map,
+        )
+        return hmac.compare_digest(sup_hmac.lower(), expected.lower())
+
+    return True
 
 
 def _mint_capability_envelope(
@@ -236,6 +364,8 @@ def _mint_capability_envelope(
         supervisor_private_key=out.get("mcp_supervisor_private_key"),
         supervisor_ed25519_sig=str(out.get("mcp_supervisor_ed25519_sig", "")),
         supervisor_key_id=str(out.get("mcp_supervisor_key_id", "")),
+        supervisor_secret_key=out.get("mcp_supervisor_secret_key"),
+        supervisor_hmac_sha256=str(out.get("mcp_supervisor_hmac_sha256", "")),
     )
 
 
@@ -283,6 +413,7 @@ def _gate_and_mint_stage(
     out: dict[str, Any],
     *,
     protocol_target: Any,
+    static_check_passed: bool,
     static_proof_valid: bool,
     ast_malicious_or_broken: bool,
     protocol_err: str | None,
@@ -296,7 +427,6 @@ def _gate_and_mint_stage(
     is_frontier = bool(
         out.get("is_frontier_exception", decision.get("is_frontier_exception", False))
     )
-    supervisor_signed = bool(out.get("human_supervisor_signed", False))
     supervisor_id = str(out.get("human_supervisor_id", ""))
     effective_defer = (
         bool(out.get("defer_unsigned_frontier", False))
@@ -304,41 +434,83 @@ def _gate_and_mint_stage(
         else bool(defer_unsigned_frontier)
     )
 
-    if ast_malicious_or_broken or (not is_frontier and not static_proof_valid):
+    if protocol_target is None or ast_malicious_or_broken or (not is_frontier and not static_proof_valid):
         out["halted"] = True
         out["halt_reason"] = "L4_VERIFY_PROTOCOL_BLOCK"
         out["verification"] = {
             "sql_passed": True,
+            "static_check_passed": False,
             "mcp_envelope": None,
         }
         _record_traces(
             out,
             summary=(
                 f"Protocol/AST verification blocked {stage_label}: "
-                f"{protocol_err or 'invalid protocol'}"
+                f"{protocol_err or 'invalid or missing protocol'}"
             ),
             replace_existing_repo_trace=replace_existing_repo_trace,
         )
         return out
 
-    if is_frontier and not supervisor_signed:
+    try:
         active_gate, epoch = _resolve_gate_for_packet(out, mcp_gate)
-        nonce = out.get("mcp_nonce")
-        unsigned_frontier_env = active_gate.mint(
-            protocol_target,
-            token_epoch=epoch,
-            nonce=str(nonce) if isinstance(nonce, str) and nonce.strip() else None,
-            lean_proof_valid=bool(out.get("lean_proof_valid", False)),
-            is_frontier_exception=True,
-            human_supervisor_signed=False,
-            human_supervisor_id="",
-            envelope_bounds=bounds_map,
+    except (PermissionError, TypeError, ValueError) as exc:
+        out["halted"] = True
+        out["halt_reason"] = "L4_VERIFY_PROTOCOL_BLOCK"
+        out["verification"] = {
+            "sql_passed": True,
+            "static_check_passed": static_check_passed,
+            "mcp_envelope": None,
+        }
+        _record_traces(
+            out,
+            summary=f"MCP key policy blocked {stage_label}: {exc}",
+            replace_existing_repo_trace=replace_existing_repo_trace,
         )
+        return out
+
+    supervisor_signed = _has_verifiable_packet_supervisor_signature(
+        out,
+        protocol_target=protocol_target,
+        bounds_map=bounds_map,
+        epoch=epoch,
+        mcp_gate=active_gate,
+    )
+
+    if is_frontier and not supervisor_signed:
         if effective_defer:
+            nonce = out.get("mcp_nonce")
+            try:
+                unsigned_frontier_env = active_gate.mint(
+                    protocol_target,
+                    token_epoch=epoch,
+                    nonce=str(nonce) if isinstance(nonce, str) and nonce.strip() else None,
+                    lean_proof_valid=False,
+                    is_frontier_exception=True,
+                    human_supervisor_signed=False,
+                    human_supervisor_id="",
+                    envelope_bounds=bounds_map,
+                )
+            except (PermissionError, TypeError, ValueError) as exc:
+                out["halted"] = True
+                out["halt_reason"] = "L4_VERIFY_PROTOCOL_BLOCK"
+                out["verification"] = {
+                    "sql_passed": True,
+                    "static_check_passed": static_check_passed,
+                    "mcp_envelope": None,
+                }
+                _record_traces(
+                    out,
+                    summary=f"MCP minting blocked frontier deferral: {exc}",
+                    replace_existing_repo_trace=replace_existing_repo_trace,
+                )
+                return out
+
             out["halted"] = True
             out["halt_reason"] = "L4_VERIFY_FRONTIER_DEFERRED"
             out["verification"] = {
                 "sql_passed": True,
+                "static_check_passed": static_check_passed,
                 "mcp_envelope": unsigned_frontier_env.to_dict(),
                 "frontier_deferred": True,
                 "deferred_nonce": unsigned_frontier_env.nonce,
@@ -363,30 +535,48 @@ def _gate_and_mint_stage(
         out["halt_reason"] = "L4_VERIFY_PROTOCOL_BLOCK"
         out["verification"] = {
             "sql_passed": True,
+            "static_check_passed": static_check_passed,
             "mcp_envelope": None,
         }
         _record_traces(
             out,
             summary=(
-                "Unsigned out-of-regime frontier exception blocked at L4 "
-                "(requires human supervisor co-signature or defer_unsigned_frontier=True)"
+                "Unsigned or self-declared frontier exception blocked at L4 "
+                "(requires verifiable supervisor signature or defer_unsigned_frontier=True)"
             ),
             replace_existing_repo_trace=replace_existing_repo_trace,
         )
         return out
 
-    minted = _mint_capability_envelope(
-        out,
-        protocol_target,
-        bounds_map,
-        mcp_gate=mcp_gate,
-        lean_proof_valid=static_proof_valid if not is_frontier else bool(out.get("lean_proof_valid", False)),
-        is_frontier_exception=is_frontier,
-        human_supervisor_signed=supervisor_signed,
-        human_supervisor_id=supervisor_id,
-    )
+    try:
+        minted = _mint_capability_envelope(
+            out,
+            protocol_target,
+            bounds_map,
+            mcp_gate=active_gate,
+            lean_proof_valid=static_proof_valid if not is_frontier else False,
+            is_frontier_exception=is_frontier,
+            human_supervisor_signed=supervisor_signed,
+            human_supervisor_id=supervisor_id,
+        )
+    except (PermissionError, TypeError, ValueError) as exc:
+        out["halted"] = True
+        out["halt_reason"] = "L4_VERIFY_PROTOCOL_BLOCK"
+        out["verification"] = {
+            "sql_passed": True,
+            "static_check_passed": static_check_passed,
+            "mcp_envelope": None,
+        }
+        _record_traces(
+            out,
+            summary=f"MCP capability minting blocked {stage_label}: {exc}",
+            replace_existing_repo_trace=replace_existing_repo_trace,
+        )
+        return out
+
     out["verification"] = {
         "sql_passed": True,
+        "static_check_passed": static_check_passed,
         "mcp_envelope": minted.to_dict(),
     }
     _record_traces(
@@ -405,13 +595,14 @@ def process_packet(
     *,
     mcp_gate: LeanMcpGate | None = None,
     defer_unsigned_frontier: bool | None = None,
+    db_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Execute the Layer L4 `lab-verify` SQL & `lean-mcp/v1` capability wire gate."""
     out = _init_wire_packet(packet)
     if out["halted"]:
         return out
 
-    sql_verdict = _evaluate_readonly_sql(out)
+    sql_verdict = _evaluate_readonly_sql(out, db_path=db_path)
     if not sql_verdict.passed:
         out["halted"] = True
         out["halt_reason"] = "L4_VERIFY_SQL_BLOCK"
@@ -435,6 +626,7 @@ def process_packet(
     )
     (
         protocol_target,
+        static_check_passed,
         static_proof_valid,
         ast_malicious_or_broken,
         inferred_bounds,
@@ -451,6 +643,7 @@ def process_packet(
     return _gate_and_mint_stage(
         out,
         protocol_target=protocol_target,
+        static_check_passed=static_check_passed,
         static_proof_valid=static_proof_valid,
         ast_malicious_or_broken=ast_malicious_or_broken,
         protocol_err=protocol_err,
@@ -467,6 +660,7 @@ def mint_for_compiled_stepbot(
     *,
     mcp_gate: LeanMcpGate | None = None,
     defer_unsigned_frontier: bool | None = None,
+    db_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Verify SQL and mint a `lean-mcp/v1` envelope bound to `stepbot_compiled.python_code`."""
     out = _init_wire_packet(packet)
@@ -488,7 +682,7 @@ def mint_for_compiled_stepbot(
         else out.get("envelope_bounds")
     )
 
-    sql_verdict = _evaluate_readonly_sql(out)
+    sql_verdict = _evaluate_readonly_sql(out, db_path=db_path)
     if not sql_verdict.passed:
         out["halted"] = True
         out["halt_reason"] = "L4_VERIFY_SQL_BLOCK"
@@ -508,6 +702,7 @@ def mint_for_compiled_stepbot(
 
     (
         _,
+        static_check_passed,
         static_proof_valid,
         ast_malicious_or_broken,
         inferred_bounds,
@@ -518,6 +713,7 @@ def mint_for_compiled_stepbot(
     return _gate_and_mint_stage(
         out,
         protocol_target=python_code,
+        static_check_passed=static_check_passed,
         static_proof_valid=static_proof_valid,
         ast_malicious_or_broken=ast_malicious_or_broken,
         protocol_err=protocol_err,
@@ -537,13 +733,16 @@ def cosign_deferred_packet(
     mcp_gate: LeanMcpGate | None = None,
     current_deck_epoch: int | None = None,
     secret_key: str | bytes | None = None,
+    supervisor_secret_key: str | bytes | None = None,
+    supervisor_hmac_sha256: str = "",
     supervisor_private_key: Any | None = None,
     supervisor_ed25519_sig: str = "",
     supervisor_key_id: str = "",
     new_nonce: str | None = None,
     ttl_seconds: int | None = None,
+    allow_insecure_dev_key: bool = False,
 ) -> dict[str, Any]:
-    """Release a deferred overnight frontier packet with a human supervisor co-signature for `stepbot`."""
+    """Release a deferred overnight frontier packet with a cryptographic human supervisor co-signature."""
     if not isinstance(supervisor_id, str) or not supervisor_id.strip():
         raise ValueError("supervisor_id must be a non-empty string")
     clean_sup_id = supervisor_id.strip()
@@ -557,6 +756,8 @@ def cosign_deferred_packet(
             supervisor_private_key=supervisor_private_key,
             supervisor_ed25519_sig=supervisor_ed25519_sig,
             supervisor_key_id=supervisor_key_id,
+            supervisor_secret_key=supervisor_secret_key,
+            supervisor_hmac_sha256=supervisor_hmac_sha256,
             current_deck_epoch=current_deck_epoch,
             ttl_seconds=ttl_seconds,
         )
@@ -598,6 +799,8 @@ def cosign_deferred_packet(
                 supervisor_private_key=supervisor_private_key,
                 supervisor_ed25519_sig=supervisor_ed25519_sig,
                 supervisor_key_id=supervisor_key_id,
+                supervisor_secret_key=supervisor_secret_key,
+                supervisor_hmac_sha256=supervisor_hmac_sha256,
                 current_deck_epoch=current_deck_epoch,
                 ttl_seconds=ttl_seconds,
             )
@@ -612,11 +815,13 @@ def cosign_deferred_packet(
                     else int(out.get("deck_epoch", prev_env.token_epoch))
                 )
             )
-            eff_secret = (
-                secret_key
-                if secret_key is not None
-                else (out.get("mcp_secret_key") or DEFAULT_MCP_SECRET)
+            eff_secret = secret_key if secret_key is not None else out.get("mcp_secret_key")
+            eff_sup_secret = (
+                supervisor_secret_key
+                if supervisor_secret_key is not None
+                else out.get("mcp_supervisor_secret_key")
             )
+            eff_allow_dev = bool(allow_insecure_dev_key or out.get("allow_insecure_dev_key", False))
             stepbot_compiled = (
                 out["stepbot_compiled"]
                 if isinstance(out.get("stepbot_compiled"), Mapping)
@@ -629,6 +834,9 @@ def cosign_deferred_packet(
             proto_sha = (
                 None if isinstance(proto_target, str) else prev_env.protocol_sha256
             )
+            clean_bounds = {
+                k: v for k, v in prev_env.envelope_bounds.items() if k != "supervisor_hmac_sha256"
+            }
             cosigned_env = mint_mcp_envelope(
                 proto_target if isinstance(proto_target, str) else None,
                 protocol_sha256=proto_sha,
@@ -636,21 +844,27 @@ def cosign_deferred_packet(
                 token_epoch=epoch,
                 tool_name=prev_env.tool_name,
                 nonce=prev_env.nonce if new_nonce is None else new_nonce,
-                lean_proof_valid=prev_env.lean_proof_valid,
+                lean_proof_valid=False,
                 is_frontier_exception=True,
                 human_supervisor_signed=True,
                 human_supervisor_id=clean_sup_id,
-                envelope_bounds=prev_env.envelope_bounds,
+                envelope_bounds=clean_bounds,
                 minter_private_key=out.get("mcp_minter_private_key"),
                 minter_key_id=str(out.get("mcp_minter_key_id", prev_env.minter_key_id)),
                 supervisor_private_key=supervisor_private_key or out.get("mcp_supervisor_private_key"),
                 supervisor_ed25519_sig=supervisor_ed25519_sig,
                 supervisor_key_id=supervisor_key_id,
+                supervisor_secret_key=eff_sup_secret,
+                supervisor_hmac_sha256=supervisor_hmac_sha256,
                 ttl_seconds=ttl_seconds,
+                allow_insecure_dev_key=eff_allow_dev,
             )
     else:
         raise TypeError("packet_or_gate must be a deferred packet mapping or LeanMcpGate")
 
+    prev_static = bool(
+        (out.get("verification") or {}).get("static_check_passed", cosigned_env.static_check_passed)
+    )
     out["halted"] = False
     out["halt_reason"] = None
     out["deck_epoch"] = cosigned_env.token_epoch
@@ -659,6 +873,7 @@ def cosign_deferred_packet(
     out["human_supervisor_id"] = clean_sup_id
     out["verification"] = {
         "sql_passed": True,
+        "static_check_passed": prev_static,
         "mcp_envelope": cosigned_env.to_dict(),
     }
     _record_traces(

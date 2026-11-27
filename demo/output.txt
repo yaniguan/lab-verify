@@ -9,7 +9,7 @@ Toy lab database with SYNTHETIC data: 12 experiments, 14 samples, 4 instruments.
  2  correct                  PASS                 match
  3  COUNT vs COUNT DISTINCT  4 execution          value (14,) vs gold (5,)
  4  syntax error             1 parse              Expecting ). Line 1, Col: 25.
- 4  correct                  PASS                 match
+ 4  NULL-unsafe average      4 execution          counterexample db #3 mismatch: value (54.1,) vs 
  5  DELETE                   2 read-only          Delete statement
  5  stacked DROP             2 read-only          2 statements (Select, Drop)
  6  wrong join               4 execution          0 rows vs 4 gold rows
@@ -30,9 +30,9 @@ Candidates stopped at each layer:
   layer 1 parse      1
   layer 2 read-only  3
   layer 3 schema     3
-  layer 4 execution  7
-  passed all     8
+  layer 4 execution  8
+  passed all     7
 
 Gate verdict agrees with hand label: 22/22
-Wrong candidates: 14; wrong ones passing the full gate: 0
-Wrong candidates that would pass with layers 1-3 only: 7/14
+Wrong candidates: 15; wrong ones passing the full gate: 0
+Wrong candidates that would pass with layers 1-3 only: 8/15
